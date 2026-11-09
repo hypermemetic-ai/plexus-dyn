@@ -31,6 +31,16 @@
 //! good (plexus-core: "schema changed; restart the service"); `dyn` connects
 //! a fresh one and swaps it in — at the next look, or at once on a call.
 //!
+//! **The top level** ([`DynOptions::top_level`], NEST-15): each peer is also
+//! served at the service's own top level — `<name>.<path>.<method>`, as a
+//! `--child` mount is (`svc w weather forecast`, not `svc dyn peer w weather
+//! forecast`) — through plexus-core's service root, added and removed as the
+//! peer is; `dyn.peer.<name>` keeps working beside it. A name the service
+//! already serves at its top level is refused. At the top level a peer is
+//! gated as a mounted child is: each method on its own grant
+//! (`w.weather.forecast`), admin's unless a role lists it — not the slot's
+//! `dyn.{peer}`.
+//!
 //! **`--peers FILE`** ([`DynOptions::peers_file`]): a TOML of peers connected
 //! at [`DynActivation::start`]; one that fails is listed down, never dropped,
 //! and tried again at every look.
@@ -50,7 +60,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use plexus_core::plexus::peer::{Peer, PeerError};
-use plexus_core::plexus::{ChildOptions, ChildSpec, DynamicHub, RemoteChild, WeakService};
+use plexus_core::plexus::{ChildOptions, ChildSpec, DynamicHub, RemoteChild, ServiceRoot, WeakService};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +79,9 @@ pub struct DynOptions {
     pub liveness: Duration,
     /// Peers connected at [`DynActivation::start`].
     pub peers_file: Option<PathBuf>,
+    /// NEST-15: serve each peer at the service's top level too
+    /// (`<name>.<path>.<method>`), beside `dyn.peer.<name>`. Off by default.
+    pub top_level: bool,
 }
 
 impl Default for DynOptions {
@@ -80,6 +93,7 @@ impl Default for DynOptions {
             dendrite_timeout: Duration::from_secs(60),
             liveness: Duration::from_secs(5),
             peers_file: None,
+            top_level: false,
         }
     }
 }
@@ -152,6 +166,8 @@ struct Inner {
     dialing: tokio::sync::Mutex<()>,
     host: Mutex<Option<WeakService>>,
     started: std::sync::atomic::AtomicBool,
+    /// NEST-15: the names this `dyn` serves at the service's top level.
+    top: Mutex<std::collections::BTreeSet<String>>,
 }
 
 /// The `dyn` activation. Cheap to clone.
@@ -184,6 +200,7 @@ impl DynActivation {
                 dialing: tokio::sync::Mutex::new(()),
                 host: Mutex::default(),
                 started: Default::default(),
+                top: Mutex::default(),
             }),
         }
     }
@@ -201,6 +218,13 @@ impl DynActivation {
         *self.inner.host.lock().unwrap() = Some(service.downgrade());
         if self.inner.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
+        }
+        // NEST-15: peers connected before the service was known.
+        let mounted: Vec<(String, RemoteChild)> = self.inner.peers.lock().unwrap().iter().filter_map(|(n, e)| e.child.clone().map(|c| (n.clone(), c))).collect();
+        for (name, child) in mounted {
+            if let Err(why) = self.surface(&name, &child) {
+                tracing::warn!(target: "plexus::dyn", peer = %name, "{why}");
+            }
         }
         if let Some(file) = &self.inner.opts.peers_file {
             for (name, kind) in read_peers_file(file)? {
@@ -273,6 +297,45 @@ impl DynActivation {
         }
     }
 
+    /// NEST-15: the service's root, while the service lives.
+    fn root(&self) -> Option<ServiceRoot> {
+        self.inner.host.lock().unwrap().as_ref().and_then(WeakService::upgrade).map(|s| s.root())
+    }
+
+    /// NEST-15: whether `name` may go on the service's top level — free, or
+    /// this `dyn`'s already.
+    fn top_free(&self, name: &str) -> Result<(), String> {
+        if !self.inner.opts.top_level || self.inner.top.lock().unwrap().contains(name) {
+            return Ok(());
+        }
+        match self.root() {
+            Some(root) if root.contains(name) => Err(format!("the service serves `{name}` at its top level already")),
+            _ => Ok(()),
+        }
+    }
+
+    /// NEST-15: with [`DynOptions::top_level`], serve `child` as `name` at
+    /// the service's top level (replacing this `dyn`'s earlier mount of it).
+    fn surface(&self, name: &str, child: &RemoteChild) -> Result<(), String> {
+        if !self.inner.opts.top_level {
+            return Ok(());
+        }
+        let Some(root) = self.root() else { return Ok(()) };
+        self.top_free(name)?;
+        root.replace(child.clone()).map_err(|e| e.to_string())?;
+        self.inner.top.lock().unwrap().insert(name.to_string());
+        Ok(())
+    }
+
+    /// NEST-15: `name` off the service's top level, if this `dyn` put it there.
+    fn unsurface(&self, name: &str) {
+        if self.inner.top.lock().unwrap().remove(name) {
+            if let Some(root) = self.root() {
+                root.remove(name);
+            }
+        }
+    }
+
     /// The options a mount of `kind` takes.
     fn child_options(&self, kind: &PeerKind) -> ChildOptions {
         let mut o = self.inner.opts.child.clone();
@@ -327,6 +390,10 @@ impl DynActivation {
                 }
                 e.child = Some(child.clone());
                 e.why = None;
+                drop(peers);
+                if let Err(why) = self.surface(name, &child) {
+                    tracing::warn!(target: "plexus::dyn", peer = %name, "{why}");
+                }
                 Ok(child)
             }
             Err(why) => {
@@ -348,6 +415,9 @@ impl DynActivation {
         if replaced && !replace {
             return DynEvent::Error { message: format!("a peer is connected as `{name}`: disconnect it, or connect with `replace`") };
         }
+        if let Err(message) = self.top_free(&name) {
+            return DynEvent::Error { message };
+        }
         // Mounted beside the old one, swapped in only once it is up.
         let spec = match self.spec(&name, &kind) {
             Ok(s) => s,
@@ -360,7 +430,11 @@ impl DynActivation {
                 let schema = plexus_core::plexus::Activation::plugin_schema(&child);
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
-                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child), why: None, remounts: 0 });
+                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0 });
+                if let Err(message) = self.surface(&name, &child) {
+                    self.inner.peers.lock().unwrap().remove(&name);
+                    return DynEvent::Error { message };
+                }
                 DynEvent::Connected { name, interface, methods, replaced }
             }
             Err(e) => DynEvent::Error { message: e.to_string() },
@@ -485,10 +559,15 @@ impl DynActivation {
     /// Let go of the peer `name` (a dendrite's process ends with its last call).
     #[plexus_macros::method]
     pub async fn disconnect(&self, name: String) -> DynEvent {
-        match self.inner.peers.lock().unwrap().remove(&name) {
-            Some(_) => DynEvent::Disconnected { name },
+        let gone = self.inner.peers.lock().unwrap().remove(&name);
+        match gone {
+            Some(_) => {
+                self.unsurface(&name);
+                DynEvent::Disconnected { name }
+            }
             None => DynEvent::Error { message: format!("no peer `{name}`") },
         }
+
     }
 
     /// Every peer: its kind, whether it is up, its interface's hash, its

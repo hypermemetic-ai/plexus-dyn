@@ -1,10 +1,11 @@
 //! A service with `dyn`, on a WebSocket:
 //!
 //! ```sh
-//! cargo run --example dyn_service -- PORT [--peers FILE] [--data-dir DIR] [--dendrite PATH]
+//! cargo run --example dyn_service -- PORT [--peers FILE] [--data-dir DIR] [--dendrite PATH] [--top-level]
 //! synapse -P PORT svc dyn connect --name weather --url ws://127.0.0.1:4801
 //! synapse -P PORT svc dyn peers
 //! synapse -P PORT svc dyn peer weather weather forecast --city lisbon
+//! synapse -P PORT svc weather weather forecast --city lisbon      # with --top-level (NEST-15)
 //! synapse -P PORT svc dyn grow --name digest --source "$(cat index.ts)" --targets weather.weather
 //! ```
 //!
@@ -23,10 +24,15 @@ use plexus_transport::TransportServer;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).with_writer(std::io::stderr).init();
     let mut args = std::env::args().skip(1);
-    let usage = "usage: dyn_service PORT [--peers FILE] [--data-dir DIR] [--dendrite PATH]";
+    let usage = "usage: dyn_service PORT [--peers FILE] [--data-dir DIR] [--dendrite PATH] [--top-level]";
     let port: u16 = args.next().ok_or_else(|| anyhow::anyhow!(usage))?.parse()?;
     let mut opts = DynOptions::default();
     while let Some(a) = args.next() {
+        // NEST-15: each peer at the service's top level too (`svc weather …`).
+        if a == "--top-level" {
+            opts.top_level = true;
+            continue;
+        }
         let v = args.next().ok_or_else(|| anyhow::anyhow!(usage))?;
         match a.as_str() {
             "--peers" => opts.peers_file = Some(PathBuf::from(v)),

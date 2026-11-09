@@ -12,7 +12,9 @@
 //!   as the caller: one holding the dendrite's method alone is refused the
 //!   peer it calls;
 //! - a peer that goes silent is marked down by the ping;
-//! - `--peers FILE`: a failing peer listed down, then up once it is.
+//! - `--peers FILE`: a failing peer listed down, then up once it is;
+//! - NEST-15, `top_level`: a peer served at the host's own top level too,
+//!   gated by its own grants, gone with it; `dyn.peer.<name>` unchanged.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -29,6 +31,7 @@ const ADMIN: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const USER: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const VIEWER: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const DIGEST_ONLY: &str = "key:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const TOP: &str = "key:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 // ------------------------------------------------------------------ the far service
 
@@ -138,14 +141,20 @@ struct Rig {
 
 /// ADMIN: admin; USER: `dyn.{peer}` and `dyn.peers`; VIEWER: viewer
 /// (`dyn.peers`, `dyn.names`); DIGEST_ONLY: the literal
-/// `dyn.peer.digest.rainy` and nothing else.
+/// `dyn.peer.digest.rainy` and nothing else; TOP: `w.weather.forecast` (a
+/// peer at the top level, NEST-15) and nothing else.
 async fn rig_with(peers_file: Option<PathBuf>) -> Rig {
+    rig_opts(peers_file, false).await
+}
+
+async fn rig_opts(peers_file: Option<PathBuf>, top_level: bool) -> Rig {
     let data = tempfile::tempdir().unwrap();
     let opts = DynOptions {
         data_dir: data.path().to_path_buf(),
         dendrite: dendrite_bin(),
         liveness: Duration::from_millis(300),
         peers_file,
+        top_level,
         ..DynOptions::default()
     };
     let dyn_ = DynActivation::new(opts);
@@ -154,9 +163,10 @@ async fn rig_with(peers_file: Option<PathBuf>) -> Rig {
     let mut lists: Vec<(String, Vec<String>)> = declared.into_iter().collect();
     lists.push(("user".into(), vec!["dyn.{peer}".into(), "dyn.peers".into()]));
     lists.push(("digest_only".into(), vec!["dyn.peer.digest.rainy".into()]));
+    lists.push(("top".into(), vec!["w.weather.forecast".into()]));
     let roles = RoleTable::from_lists(lists.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let members = Arc::new(Members::default());
-    for (p, r) in [(ADMIN, "admin"), (USER, "user"), (VIEWER, "viewer"), (DIGEST_ONLY, "digest_only")] {
+    for (p, r) in [(ADMIN, "admin"), (USER, "user"), (VIEWER, "viewer"), (DIGEST_ONLY, "digest_only"), (TOP, "top")] {
         members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::Everywhere });
     }
     let gate = Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere)));
@@ -414,6 +424,46 @@ async fn the_peers_file_is_connected_at_start() {
     stop(far).await;
 }
 
+async fn a_peer_grows_the_top_level() {
+    let port = free_port();
+    let far = far(port, false).await;
+    let r = rig_opts(None, true).await;
+    let top = |r: &Rig| -> Vec<String> { r.host.root().names() };
+    assert_eq!(top(&r), ["dyn"]);
+    let url = format!("ws://127.0.0.1:{port}");
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    assert_eq!(top(&r), ["dyn", "w"]);
+    // At the top level: `w.weather.forecast`, on its own grant.
+    let days = call(&r, TOP, "w.weather.forecast", json!({ "city": "lisbon" })).await;
+    assert_eq!(days.len(), 7, "{days:?}");
+    let refused = call(&r, USER, "w.weather.forecast", json!({ "city": "lisbon" })).await;
+    assert!(refused[0]["route_error"].as_str().is_some_and(|e| e.contains("w.weather.forecast")), "{refused:?}");
+    // The slot form beside it, unchanged.
+    let days = call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "lisbon" })).await;
+    assert_eq!(days.len(), 7, "{days:?}");
+    // The host's schema lists it.
+    let schema = call(&r, ADMIN, "host.schema", json!({})).await;
+    let kids: Vec<&str> = schema[0]["children"].as_array().unwrap().iter().map(|c| c["namespace"].as_str().unwrap()).collect();
+    assert_eq!(kids, ["dyn", "w"], "{schema:?}");
+    // A name the service serves already is refused.
+    let taken = call(&r, ADMIN, "dyn.connect", json!({ "name": "dyn", "url": url })).await;
+    assert!(taken[0]["message"].as_str().is_some_and(|m| m.contains("top level")), "{taken:?}");
+    assert_eq!(call(&r, VIEWER, "dyn.names", json!({})).await, [json!("w")]);
+    // Disconnected: gone from the top level.
+    call(&r, ADMIN, "dyn.disconnect", json!({ "name": "w" })).await;
+    assert_eq!(top(&r), ["dyn"]);
+    let gone = call(&r, ADMIN, "w.weather.forecast", json!({ "city": "lisbon" })).await;
+    assert!(gone[0]["route_error"].as_str().is_some_and(|e| e.contains("w")), "{gone:?}");
+    // The far side restarts: the top-level entry is the fresh mount.
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
+    stop(far).await;
+    let far = self::far(port, true).await;
+    let days = until_data(&r, TOP, "w.weather.forecast", json!({ "city": "lisbon" }), Duration::from_secs(15)).await;
+    assert_eq!(days.len(), 7, "{days:?}");
+    stop(far).await;
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(async {
@@ -428,7 +478,8 @@ fn main() {
             a_dendrite_calls_its_target_through_the_host,
             a_silent_peer_is_marked_down,
             a_live_peer_stays_up_through_its_pings,
-            the_peers_file_is_connected_at_start
+            the_peers_file_is_connected_at_start,
+            a_peer_grows_the_top_level
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });
