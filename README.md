@@ -17,6 +17,18 @@ dendrites, each served as a peer in one untyped slot:
 holds them. `dyn.{peer}` is the untyped slot's grant, also `admin`'s
 unless a role lists it; the peer decides again inside it.
 
+## At the top level (`top_level`)
+
+With `DynOptions { top_level: true, .. }` (the example's `--top-level`),
+each peer is also served at the service's own top level — `<name>.<path>.<method>`,
+`svc w weather forecast` rather than `svc dyn peer w weather forecast` —
+through plexus-core's service root (0.10.2, NEST-15): added as it is
+connected or grown, swapped on a remount, removed on `disconnect`.
+`dyn.peer.<name>` keeps working beside it. A name the service already
+serves at its top level is refused. There a peer is gated as a mounted
+child is: each method on its own grant (`w.weather.forecast`), `admin`'s
+unless a role lists it.
+
 ## A dendrite calls through the host
 
 A dendrite's call back is routed by the host's own gate **as the caller of
