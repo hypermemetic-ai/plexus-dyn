@@ -14,8 +14,8 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 # clone of plexus-dyn alone builds; developing against sibling checkouts is a
 # git-ignored [patch.crates-io] in .cargo/config.toml (hyperforge build link).
 plexus-core = "0.10.1"
-plexus-macros = "0.10.0"
-plexus-client = "0.10.0"
+plexus-macros = "0.11.0"
+plexus-client = "0.11.0"
 # What #[plexus_macros::activation] expands to names these crates.
 async-trait = "0.1"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
