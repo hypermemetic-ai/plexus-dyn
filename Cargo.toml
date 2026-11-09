@@ -1,0 +1,45 @@
+[package]
+name = "plexus-dyn"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A Plexus activation that connects to other services at runtime and grows TypeScript dendrites, each served as a peer: dyn.peer.<name>.<path>.<method>."
+repository = "https://github.com/hypermemetic-ai/plexus-dyn"
+readme = "README.md"
+keywords = ["plexus", "rpc", "peer", "dendrite"]
+
+[dependencies]
+# NEST-11/NEST-12: plexus-core 0.10.1 (the child's calls back, a child's
+# liveness and remount hooks) — not yet on crates.io: by path beside it.
+plexus-core = { path = "../plexus-core", version = "0.10.1" }
+plexus-macros = { path = "../plexus-macros", version = "0.10.0" }
+plexus-client = { path = "../plexus-macros/plexus-client", version = "0.10.0" }
+# What #[plexus_macros::activation] expands to names these crates.
+async-trait = "0.1"
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1" }
+uuid = { version = "1", features = ["v4"] }
+async-stream = "0.3"
+futures = "0.3"
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+toml = "0.8"
+tracing = "0.1"
+
+[dev-dependencies]
+plexus-transport = { path = "../plexus-transport", version = "0.9", default-features = false }
+tempfile = "3"
+# A peer that goes silent (tests/dyn.rs): a raw WebSocket server.
+tokio-tungstenite = "0.30"
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[[example]]
+name = "dyn_service"
+
+# NEST-12: one runtime for every row (loopback services, a dendrite process).
+[[test]]
+name = "dyn"
+harness = false
