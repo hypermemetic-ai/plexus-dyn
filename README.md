@@ -6,12 +6,18 @@ dendrites, each served as a peer in one untyped slot:
 
 | method | who | what |
 | -- | -- | -- |
-| `dyn.connect { name, url, replace? }` | admin | a service on a WebSocket, mounted as the peer `name` (a taken name refused unless `replace`) |
-| `dyn.grow { name, source, targets, replace? }` | admin | `source` written to `<data-dir>/<name>/index.ts` and served by `plexus-dendrite serve DIR --via-host …`; each target (`w` or `w.weather`, a peer's path) is grown from the host's view of `dyn.peer.<target>` and called back **through the host** |
+| `dyn.connect { name, url, replace?, expecting? }` | admin | a service on a WebSocket, mounted as the peer `name` (a taken name refused unless `replace`); `expecting` an interface hash (a contract's stamp) it must serve, at connect and every remount (NEST-16) |
+| `dyn.grow { name, source, targets, replace?, expecting? }` | admin | `source` written to `<data-dir>/<name>/index.ts` and served by `plexus-dendrite serve DIR --via-host …`; each target (`w` or `w.weather`, a peer's path) is grown from the host's view of `dyn.peer.<target>` and called back **through the host** |
 | `dyn.disconnect { name }` | admin | let go |
 | `dyn.peers` | viewer | each peer: kind (`ws` / `dendrite`), up, why down, interface hash, restarts, open calls, calls, calls back, remounts |
 | `dyn.names` | viewer | each peer's name — the slot's list |
 | `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead |
+
+**Grafts** (NEST-16): every connect, grow and remount reads the peer's
+`needs` (what it calls of this service: a graft written with `parent =
+ShopClient`, or a dendrite calling back `--via-host`) and refuses it unless
+this service serves each, by its shape hash, naming every one missing or
+changed. A need below `dyn.{peer}` counts as served when the slot is.
 
 `connect`, `grow` and `disconnect` are listed in no role: only `admin`
 holds them. `dyn.{peer}` is the untyped slot's grant, also `admin`'s
