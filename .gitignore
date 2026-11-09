@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+# a git-ignored [patch.crates-io] onto sibling checkouts (hyperforge build link)
+/.cargo

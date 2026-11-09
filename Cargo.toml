@@ -10,14 +10,16 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 
 [dependencies]
 # NEST-11/NEST-12: plexus-core 0.10.1 (the child's calls back, a child's
-# liveness and remount hooks) — not yet on crates.io: by path beside it.
-plexus-core = { path = "../plexus-core", version = "0.10.1" }
-plexus-macros = { path = "../plexus-macros", version = "0.10.0" }
-plexus-client = { path = "../plexus-macros/plexus-client", version = "0.10.0" }
+# liveness and remount hooks). Every Plexus crate by published version, so a
+# clone of plexus-dyn alone builds; developing against sibling checkouts is a
+# git-ignored [patch.crates-io] in .cargo/config.toml (hyperforge build link).
+plexus-core = "0.10.1"
+plexus-macros = "0.10.0"
+plexus-client = "0.10.0"
 # What #[plexus_macros::activation] expands to names these crates.
 async-trait = "0.1"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
-plexus-auth-core = { path = "../plexus-auth-core", version = "0.3.1" }
+plexus-auth-core = "0.3.1"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
 futures = "0.3"
@@ -29,7 +31,7 @@ toml = "0.8"
 tracing = "0.1"
 
 [dev-dependencies]
-plexus-transport = { path = "../plexus-transport", version = "0.9", default-features = false }
+plexus-transport = { version = "0.9", default-features = false }
 tempfile = "3"
 # A peer that goes silent (tests/dyn.rs): a raw WebSocket server.
 tokio-tungstenite = "0.30"
