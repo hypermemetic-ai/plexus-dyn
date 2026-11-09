@@ -1,6 +1,6 @@
 [package]
 name = "plexus-dyn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "A Plexus activation that connects to other services at runtime and grows TypeScript dendrites, each served as a peer: dyn.peer.<name>.<path>.<method>."

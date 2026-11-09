@@ -1,6 +1,9 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] — unreleased
+
+On plexus-core, plexus-macros and plexus-client 0.11 (NEST-24): a new minor,
+since 0.1.0 is on plexus-core 0.10.1 and this one cannot share its number.
 
 NEST-21: **settings and re-pinning.** `dyn` reads the service's
 configuration (plexus-core's `config`; `DynOptions::config`, else the
