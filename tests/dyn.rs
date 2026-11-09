@@ -13,6 +13,10 @@
 //!   peer it calls;
 //! - a peer that goes silent is marked down by the ping;
 //! - `--peers FILE`: a failing peer listed down, then up once it is.
+//! - DYNAUTH-8: `ws://` beyond loopback refused (`insecure_transport`), or
+//!   allowed and said (`insecure`); a `wss://` peer's certificate validated
+//!   and its key pinned — a restart with another key refused
+//!   (`identity_changed`) until it is connected again with `replace`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -140,14 +144,19 @@ struct Rig {
 /// (`dyn.peers`, `dyn.names`); DIGEST_ONLY: the literal
 /// `dyn.peer.digest.rainy` and nothing else.
 async fn rig_with(peers_file: Option<PathBuf>) -> Rig {
+    rig_opts(peers_file, |_| {}).await
+}
+
+async fn rig_opts(peers_file: Option<PathBuf>, tweak: impl FnOnce(&mut DynOptions)) -> Rig {
     let data = tempfile::tempdir().unwrap();
-    let opts = DynOptions {
+    let mut opts = DynOptions {
         data_dir: data.path().to_path_buf(),
         dendrite: dendrite_bin(),
         liveness: Duration::from_millis(300),
         peers_file,
         ..DynOptions::default()
     };
+    tweak(&mut opts);
     let dyn_ = DynActivation::new(opts);
     let plain = DynamicHub::new("host").register(dyn_.clone());
     let declared = plain.declared_roles();
@@ -414,6 +423,143 @@ async fn the_peers_file_is_connected_at_start() {
     stop(far).await;
 }
 
+
+// ------------------------------------------------------------------ DYNAUTH-8
+
+async fn ws_beyond_loopback_is_refused() {
+    use plexus_dyn::{check_url, Refusal};
+    for ok in ["ws://127.0.0.1:1", "ws://127.9.9.9/x", "ws://localhost:80", "ws://LOCALHOST.", "ws://[::1]:4", "ws://u:p@127.0.0.1:1", "wss://example.com", "wss://10.0.0.1:443/ws"] {
+        assert_eq!(check_url(ok, false), Ok(()), "{ok}");
+    }
+    for bad in ["ws://example.com", "ws://10.0.0.1:1", "ws://[::2]:1", "ws://127.0.0.1.example.com", "ws://localhost.example.com:1", "ws://u@example.com", "http://127.0.0.1", "ws://"] {
+        assert_eq!(check_url(bad, false).map_err(|e| e.0), Err(Refusal::InsecureTransport), "{bad}");
+    }
+    assert_eq!(check_url("ws://example.com", true), Ok(()), "the override");
+    let port = free_port();
+    let far = far(port, false).await;
+    let r = rig().await;
+    let refused = call(&r, ADMIN, "dyn.connect", json!({ "name": "x", "url": "ws://example.com" })).await;
+    assert_eq!((refused[0]["type"].as_str(), refused[0]["reason"].as_str()), (Some("refused"), Some("insecure_transport")), "{refused:?}");
+    assert!(r.dyn_.list().is_empty(), "nothing kept");
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://localhost:{port}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let listed = call(&r, VIEWER, "dyn.peers", json!({})).await;
+    assert_eq!(listed[0]["identity"], json!({ "backend": "far" }), "pinned at connect: {listed:?}");
+    assert!(listed[0].get("insecure").is_none(), "loopback is not insecure: {listed:?}");
+    stop(far).await;
+}
+
+async fn the_insecure_override_is_said() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("peers.toml");
+    std::fs::write(&file, "far = \"ws://example.invalid:1\"\n").unwrap();
+    // Without the override: listed down, saying why, never dialed.
+    let r = rig_with(Some(file.clone())).await;
+    let p = peer(&r, "far");
+    assert!(!p.up && p.why.as_deref().is_some_and(|w| w.contains("plain ws://")), "{p:?}");
+    assert!(p.insecure, "{p:?}");
+    // With it: dialed (and failing here: no such host), and said.
+    let r = rig_opts(Some(file), |o| o.insecure_ws = true).await;
+    let p = peer(&r, "far");
+    assert!(!p.up && p.why.as_deref().is_some_and(|w| !w.contains("plain ws://")), "{p:?}");
+    let listed = call(&r, VIEWER, "dyn.peers", json!({})).await;
+    assert_eq!(listed[0]["insecure"], true, "{listed:?}");
+}
+
+/// A test CA (rcgen), its PEM in `dir`, and leaves for 127.0.0.1.
+struct Pki {
+    dir: tempfile::TempDir,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name.push(rcgen::DnType::CommonName, "DYNAUTH-8 test CA");
+        let ca = params.self_signed(&key).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();
+        Self { dir, issuer: rcgen::Issuer::new(params, key) }
+    }
+
+    fn roots(&self) -> PathBuf {
+        self.dir.path().join("ca.pem")
+    }
+
+    /// A fresh leaf (a fresh key), written as `<name>.crt` / `<name>.key`.
+    fn leaf(&self, name: &str) -> plexus_transport::TlsConfig {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap().signed_by(&key, &self.issuer).unwrap();
+        let (c, k) = (self.dir.path().join(format!("{name}.crt")), self.dir.path().join(format!("{name}.key")));
+        std::fs::write(&c, cert.pem()).unwrap();
+        std::fs::write(&k, key.serialize_pem()).unwrap();
+        plexus_transport::TlsConfig::new(c, k)
+    }
+}
+
+/// The far service over TLS on `port`.
+async fn far_tls(port: u16, tls: plexus_transport::TlsConfig) -> plexus_transport::ServerHandle {
+    let module = DynamicHub::arc_into_rpc_module(Arc::new(DynamicHub::new("far").register(WeatherActivation))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let config = plexus_transport::WebSocketConfig::new(port).with_tls(tls.clone());
+        match plexus_transport::websocket::serve_websocket_with(module.clone(), config, None, Default::default()).await {
+            Ok((h, _)) => return h,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("port {port}: {e}"),
+        }
+    }
+}
+
+async fn a_wss_peer_is_validated_and_its_key_pinned() {
+    let pki = Pki::new();
+    let port = free_port();
+    let url = format!("wss://127.0.0.1:{port}");
+    let first = far_tls(port, pki.leaf("one")).await;
+    // Not trusting the CA: the certificate does not validate.
+    let r = rig().await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
+    assert_eq!(got[0]["type"], "error", "an unknown issuer is refused: {got:?}");
+    assert!(got[0]["message"].as_str().is_some_and(|m| m.to_lowercase().contains("certificate")), "{got:?}");
+    // Trusting it: mounted, its key pinned.
+    let r = rig_opts(None, |o| o.child.tls_roots = Some(pki.roots())).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    assert_eq!(call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    let pinned = peer(&r, "w").identity.expect("pinned");
+    assert!(pinned.tls_key.as_ref().is_some_and(|k| k.len() == 64), "{pinned:?}");
+    // The far side restarts under another key: the redial is refused, and
+    // so is every remount, until it is connected again with `replace`.
+    let _ = first.stop();
+    first.stopped().await;
+    let second = far_tls(port, pki.leaf("two")).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await;
+        let p = peer(&r, "w");
+        if p.why.as_deref().is_some_and(|w| w.contains("identity")) {
+            assert!(got.len() < 7 && !p.up, "{got:?} {p:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "a new key was never refused: {got:?} {p:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await; // a look or two: the remount refused too
+    let p = peer(&r, "w");
+    assert!(!p.up && p.identity.as_ref() == Some(&pinned) && p.why.as_deref().is_some_and(|w| w.contains("replace")), "{p:?}");
+    let again = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url, "replace": true })).await;
+    assert_eq!(again[0]["type"], "connected", "{again:?}");
+    let p = peer(&r, "w");
+    assert!(p.up && p.identity.as_ref().is_some_and(|i| i.tls_key != pinned.tls_key), "re-pinned: {p:?}");
+    assert_eq!(call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    let _ = second.stop();
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(async {
@@ -428,7 +574,10 @@ fn main() {
             a_dendrite_calls_its_target_through_the_host,
             a_silent_peer_is_marked_down,
             a_live_peer_stays_up_through_its_pings,
-            the_peers_file_is_connected_at_start
+            the_peers_file_is_connected_at_start,
+            ws_beyond_loopback_is_refused,
+            the_insecure_override_is_said,
+            a_wss_peer_is_validated_and_its_key_pinned
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });

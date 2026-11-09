@@ -45,6 +45,23 @@ nothing has come from it for two. A peer whose restart published another
 schema is refused by its mount for good; `dyn` connects a fresh mount and
 swaps it in (at the next look, or on the next call), counting a remount.
 
+## Transport (DYNAUTH-8)
+
+A WebSocket peer beyond loopback is reached by `wss://` only, its
+certificate validated against the webpki roots plus
+`DynOptions::child.tls_roots` (a PEM file of more CAs: a private one, a test
+network's). `ws://` is for `127.0.0.0/8`, `::1` and `localhost`; any other
+host is refused `{"type":"refused","reason":"insecure_transport"}` — at
+`connect`, and for a `--peers` entry, listed down saying so.
+`DynOptions::insecure_ws` allows it for a test network, and `dyn.peers` says
+`"insecure": true` on each such peer.
+
+A peer's identity is pinned when it is connected: its `_info` backend and,
+on `wss://`, the sha256 of its certificate's public key (a renewal over the
+same key is the same peer). `dyn.peers` shows it (`identity`). A redial or a
+remount that proves another is refused (`identity_changed`), the peer listed
+down saying why, until it is connected again with `replace`.
+
 ## In a service
 
 ```rust
@@ -83,7 +100,10 @@ gated host in memory: connect, call, disconnect; a caller without the grant
 refused; the far side restarted and redialed; restarted with another schema
 and remounted; a dendrite grown against a peer calling it through the host
 (and refused as a caller who lacks the peer's grant); a silent peer marked
-down by the ping; a live one staying up; the peers file. The dendrite needs
+down by the ping; a live one staying up; the peers file; `ws://` beyond
+loopback refused, or allowed and said; a `wss://` peer (a test CA, rcgen)
+refused untrusted, pinned trusted, and refused once it restarts under
+another key until it is connected again. The dendrite needs
 `plexus-dendrite` (the sibling checkout, or `PLEXUS_DENDRITE`) and Node 22.
 
 ## Rough

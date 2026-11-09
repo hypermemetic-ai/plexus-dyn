@@ -13,7 +13,9 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 # liveness and remount hooks). Every Plexus crate by published version, so a
 # clone of plexus-dyn alone builds; developing against sibling checkouts is a
 # git-ignored [patch.crates-io] in .cargo/config.toml (hyperforge build link).
-plexus-core = "0.10.1"
+# DYNAUTH-8: `child-wss` — a peer beyond loopback is reached by wss://, its
+# certificate validated and its key pinned (the plexus-core after 0.10.1).
+plexus-core = { version = "0.10.1", features = ["child-wss"] }
 plexus-macros = "0.10.0"
 plexus-client = "0.10.0"
 # What #[plexus_macros::activation] expands to names these crates.
@@ -31,7 +33,9 @@ toml = "0.8"
 tracing = "0.1"
 
 [dev-dependencies]
-plexus-transport = { version = "0.9", default-features = false }
+plexus-transport = { version = "0.9", default-features = false, features = ["tls"] }
+# DYNAUTH-8: a test CA for the wss:// peer (tests/dyn.rs).
+rcgen = "0.14"
 tempfile = "3"
 # A peer that goes silent (tests/dyn.rs): a raw WebSocket server.
 tokio-tungstenite = "0.30"
