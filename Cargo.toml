@@ -15,7 +15,9 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 # git-ignored [patch.crates-io] in .cargo/config.toml (hyperforge build link).
 # NEST-15: the service root (`DynamicHub::root`), for `top_level`; NEST-16:
 # 0.11.0 — needs checked at a graft, `Parent`, the narrowed calls back.
-plexus-core = "0.11.0"
+# DYNAUTH-8: `child-wss` — a peer beyond loopback is reached by wss://, its
+# certificate validated and its key pinned.
+plexus-core = { version = "0.11.0", features = ["child-wss"] }
 plexus-macros = "0.11.0"
 plexus-client = "0.11.0"
 # What #[plexus_macros::activation] expands to names these crates.
@@ -32,13 +34,28 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 toml = "0.8"
 tracing = "0.1"
 
+# DYNAUTH-9: a grown dendrite runs under a Landlock ruleset (the launcher,
+# `plexus-dyn-contain`). landlock 0.4.7 knows ABI 9 (Linux 7.1: a UNIX
+# socket by path); an older kernel is met best-effort.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+
 [dev-dependencies]
-plexus-transport = { version = "0.9", default-features = false }
+plexus-transport = { version = "0.9", default-features = false, features = ["tls"] }
+# DYNAUTH-8: a test CA for the wss:// peer (tests/dyn.rs).
+rcgen = "0.14"
 tempfile = "3"
 # A peer that goes silent (tests/dyn.rs): a raw WebSocket server.
 tokio-tungstenite = "0.30"
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# DYNAUTH-9: the launcher a grown dendrite is spawned through — beside the
+# service's executable or on PATH (`cargo install plexus-dyn --bin
+# plexus-dyn-contain`).
+[[bin]]
+name = "plexus-dyn-contain"
+path = "src/bin/plexus-dyn-contain.rs"
 
 [[example]]
 name = "dyn_service"

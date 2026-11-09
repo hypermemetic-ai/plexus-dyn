@@ -20,6 +20,28 @@
 //! and its calls go back **through the host** — the service's own routing and
 //! gate — as the caller of the call the dendrite is serving (NEST-11).
 //!
+//! **Transport** (DYNAUTH-8, TM-3): a WebSocket peer beyond loopback is
+//! reached by `wss://` only, its certificate validated (the webpki roots,
+//! plus [`ChildOptions::tls_roots`]); `ws://` is for `127.0.0.0/8`, `::1`
+//! and `localhost`, unless [`DynOptions::insecure_ws`] (a test network's),
+//! which `dyn.peers` says on each such peer. A peer's identity — its
+//! `_info` backend, and on `wss://` its certificate's key — is pinned when
+//! it is connected; a redial or remount that proves another is refused
+//! (`identity_changed`) until it is connected again with `replace`.
+//!
+//! **Containment** (DYNAUTH-9, TM-5): a dendrite is spawned through
+//! `plexus-dyn-contain` ([`contain`]): a cleared environment (its own
+//! `HOME` and `TMPDIR`), its own directory, and on Linux a Landlock ruleset
+//! that denies it `dyn`'s data directory, every secret store of the user's
+//! that is there ([`contain::SECRET_STORES`], [`contain::RUNTIME_SECRETS`]:
+//! `~/.plexus`, `~/.ssh`, `~/.gnupg`, `~/.password-store`, hyperforge's,
+//! gh's, menger's, cargo's credentials, docker's, kube's, the cloud CLIs',
+//! `~/.netrc`, `~/.npmrc`, `~/.pypirc`, synapse's holder socket), the dial
+//! key and [`Containment::deny`]. Where
+//! Landlock is not there it runs with the cleared environment and a
+//! warning, unless [`Containment::require`]. `dyn.grow` stays the admin's:
+//! until microVMs a dendrite is host-equivalent trust.
+//!
 //! The slot is untyped: a call is admitted on the slot grant `dyn.{peer}` (or
 //! a literal path a role lists, `dyn.peer.digest.rainy`), held by `admin`
 //! unless a role lists it, and the peer decides again inside it.
@@ -63,6 +85,8 @@
 //! via = ["weather.weather"]
 //! ```
 
+pub mod contain;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -72,6 +96,8 @@ use futures::Stream;
 use plexus_core::plexus::peer::{Peer, PeerError};
 use plexus_core::plexus::{ChildOptions, ChildSpec, DynamicHub, RemoteChild, ServiceRoot, WeakService};
 use schemars::JsonSchema;
+
+pub use contain::Containment;
 use serde::{Deserialize, Serialize};
 
 /// How `dyn` runs.
@@ -92,6 +118,13 @@ pub struct DynOptions {
     /// NEST-15: serve each peer at the service's top level too
     /// (`<name>.<path>.<method>`), beside `dyn.peer.<name>`. Off by default.
     pub top_level: bool,
+    /// DYNAUTH-8: allow plain `ws://` to a host beyond loopback — a test
+    /// network's, never a real one's: the hop (who calls, under what
+    /// ceiling) crosses it in clear. Each such peer says `insecure` in
+    /// `dyn.peers`.
+    pub insecure_ws: bool,
+    /// DYNAUTH-9: how a dendrite is contained.
+    pub contain: Containment,
 }
 
 impl Default for DynOptions {
@@ -104,6 +137,8 @@ impl Default for DynOptions {
             liveness: Duration::from_secs(5),
             peers_file: None,
             top_level: false,
+            insecure_ws: false,
+            contain: Containment::default(),
         }
     }
 }
@@ -142,6 +177,49 @@ pub struct PeerInfo {
     pub calls_back: u64,
     /// Times a fresh mount replaced one whose schema changed.
     pub remounts: u64,
+    /// DYNAUTH-8: who it proved it was when it was connected, pinned: a
+    /// redial or remount that proves another is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<PeerIdentity>,
+    /// DYNAUTH-8: reached by plain `ws://` beyond loopback, as
+    /// [`DynOptions::insecure_ws`] allows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure: bool,
+}
+
+/// DYNAUTH-8: who a peer proved it was — its `_info` backend and, on
+/// `wss://`, the sha256 of its certificate's key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PeerIdentity {
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
+}
+
+impl From<&plexus_core::plexus::PeerIdentity> for PeerIdentity {
+    fn from(p: &plexus_core::plexus::PeerIdentity) -> Self {
+        Self { backend: p.backend.clone(), tls_key: p.tls_key.clone() }
+    }
+}
+
+impl std::fmt::Display for PeerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend `{}`", self.backend)?;
+        match &self.tls_key {
+            Some(k) => write!(f, ", TLS key {}", &k[..k.len().min(16)]),
+            None => write!(f, ", no TLS key"),
+        }
+    }
+}
+
+/// Why `dyn` refused a peer (DYNAUTH-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    /// Plain `ws://` to a host beyond loopback.
+    InsecureTransport,
+    /// It proved another identity than the one pinned when it was connected.
+    IdentityChanged,
 }
 
 /// What `connect`, `grow` and `disconnect` answer.
@@ -152,6 +230,8 @@ pub enum DynEvent {
     Connected { name: String, interface: String, methods: Vec<String>, replaced: bool },
     /// A peer let go.
     Disconnected { name: String },
+    /// Refused, and why in a word (DYNAUTH-8).
+    Refused { reason: Refusal, message: String },
     /// Why not.
     Error { message: String },
 }
@@ -169,6 +249,8 @@ struct Entry {
     remounts: u64,
     /// NEST-16: the interface hash the peer must serve.
     expecting: Option<String>,
+    /// DYNAUTH-8: who it proved it was at its first mount.
+    pin: Option<PeerIdentity>,
 }
 
 struct Inner {
@@ -240,7 +322,7 @@ impl DynActivation {
         }
         if let Some(file) = &self.inner.opts.peers_file {
             for (name, kind) in read_peers_file(file)? {
-                self.inner.peers.lock().unwrap().insert(name, Entry { kind, child: None, why: Some("not connected yet".into()), remounts: 0, expecting: None });
+                self.inner.peers.lock().unwrap().insert(name, Entry { kind, child: None, why: Some("not connected yet".into()), remounts: 0, expecting: None, pin: None });
             }
             let names: Vec<String> = self.inner.peers.lock().unwrap().keys().cloned().collect();
             for name in names {
@@ -364,13 +446,17 @@ impl DynActivation {
     /// The spec a peer of `kind` is mounted from.
     fn spec(&self, name: &str, kind: &PeerKind) -> Result<ChildSpec, String> {
         match kind {
-            PeerKind::Ws { url } => Ok(ChildSpec::Ws { name: name.into(), url: url.clone() }),
+            PeerKind::Ws { url } => {
+                check_url(url, self.inner.opts.insecure_ws).map_err(|(_, why)| why)?;
+                Ok(ChildSpec::Ws { name: name.into(), url: url.clone() })
+            }
             PeerKind::Dendrite { dir, via } => {
                 let mut argv = vec![self.inner.opts.dendrite.display().to_string(), "serve".into(), dir.clone(), "--name".into(), name.into()];
                 if !via.is_empty() {
                     let paths: Vec<String> = via.iter().map(|t| format!("{}=dyn.peer.{t}", t.rsplit('.').next().unwrap_or(t))).collect();
                     argv.extend(["--via-host".into(), paths.join(",")]);
                 }
+                let argv = self.inner.opts.contain.wrap(Path::new(dir), &self.denied(), argv)?;
                 Ok(ChildSpec::Stdio { name: name.into(), argv })
             }
         }
@@ -390,7 +476,15 @@ impl DynActivation {
             }
             None => return Err(format!("no peer `{name}`")),
         };
-        let spec = self.spec(name, &kind)?;
+        let spec = match self.spec(name, &kind) {
+            Ok(s) => s,
+            Err(why) => {
+                if let Some(e) = self.inner.peers.lock().unwrap().get_mut(name) {
+                    e.why = Some(why.clone());
+                }
+                return Err(why);
+            }
+        };
         // NEST-16: the remount is the same graft: checked again.
         let mounted = match RemoteChild::connect(spec, self.child_options(&kind)).await {
             Ok(child) => self.vet(name, &child, expecting.as_deref()).map(|_| child),
@@ -400,6 +494,17 @@ impl DynActivation {
         let Some(e) = peers.get_mut(name) else { return Err(format!("`{name}` was disconnected while it was mounted")) };
         match mounted {
             Ok(child) => {
+                let proved = child.identity().map(PeerIdentity::from);
+                match (&e.pin, &proved) {
+                    (Some(pinned), Some(p)) if pinned != p => {
+                        let why = identity_changed(name, pinned, p);
+                        tracing::error!(target: "plexus::dyn", peer = %name, %pinned, proved = %p, "refused: another identity");
+                        e.why = Some(why.clone());
+                        return Err(why);
+                    }
+                    (None, _) => e.pin = proved,
+                    _ => {}
+                }
                 if remount {
                     e.remounts += 1;
                     tracing::info!(target: "plexus::dyn", peer = %name, hash = %child.mounted_hash(), "remounted: its schema changed");
@@ -471,7 +576,8 @@ impl DynActivation {
                 let schema = plexus_core::plexus::Activation::plugin_schema(&child);
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
-                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting });
+                let pin = child.identity().map(PeerIdentity::from);
+                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin });
                 if let Err(message) = self.surface(&name, &child) {
                     self.inner.peers.lock().unwrap().remove(&name);
                     return DynEvent::Error { message };
@@ -494,8 +600,8 @@ impl DynActivation {
                 let up = e.child.as_ref().is_some_and(RemoteChild::is_up);
                 let why = match (&e.child, up) {
                     (_, true) => None,
-                    // A remount refused (NEST-16) says why, over the dead mount's own reason.
-                    (Some(c), false) if c.dead().is_some() && e.why.is_some() => e.why.clone(),
+                    // A dead mount (a remount refused: NEST-16, DYNAUTH-8)'s last word is dyn's remount (refused, or failing).
+                    (Some(c), false) if c.dead().is_some() => e.why.clone().or_else(|| c.why_down()),
                     (Some(c), false) => c.why_down().or_else(|| e.why.clone()),
                     (None, false) => e.why.clone(),
                 };
@@ -510,6 +616,8 @@ impl DynActivation {
                     calls: st.calls,
                     calls_back: st.calls_back,
                     remounts: e.remounts,
+                    identity: e.pin.clone(),
+                    insecure: matches!(&e.kind, PeerKind::Ws { url } if check_url(url, false).is_err()),
                 }
             })
             .collect()
@@ -529,9 +637,71 @@ impl DynActivation {
         }
     }
 
+    /// DYNAUTH-9: what no dendrite may read.
+    fn denied(&self) -> Vec<PathBuf> {
+        let o = &self.inner.opts;
+        let mut out = Containment::default_deny(&o.data_dir);
+        out.extend(o.child.key.iter().cloned());
+        out.extend(o.contain.deny.iter().cloned());
+        out
+    }
+
     fn data_dir_for(&self, name: &str) -> PathBuf {
         self.inner.opts.data_dir.join(name)
     }
+}
+
+/// DYNAUTH-8 (TM-3): whether `url` may be dialed — `wss://` anywhere,
+/// `ws://` only to loopback (`127.0.0.0/8`, `::1`, `localhost`) unless
+/// `insecure` allows it. `Err`: the refusal, said.
+pub fn check_url(url: &str, insecure: bool) -> Result<(), (Refusal, String)> {
+    let rest = if let Some(r) = url.strip_prefix("wss://") {
+        return match host_of(r) {
+            Some(_) => Ok(()),
+            None => Err((Refusal::InsecureTransport, format!("`{url}` names no host"))),
+        };
+    } else if let Some(r) = url.strip_prefix("ws://") {
+        r
+    } else {
+        return Err((Refusal::InsecureTransport, format!("`{url}`: a peer is reached by ws:// or wss://")));
+    };
+    let Some(host) = host_of(rest) else { return Err((Refusal::InsecureTransport, format!("`{url}` names no host"))) };
+    if is_loopback(&host) || insecure {
+        return Ok(());
+    }
+    Err((
+        Refusal::InsecureTransport,
+        format!("`{url}`: plain ws:// only to loopback (127.0.0.0/8, ::1, localhost); a peer beyond it is reached by wss://, its hop (who calls, under what ceiling) never in clear"),
+    ))
+}
+
+/// The host of `authority[/path]`: no user info, no port, an IPv6
+/// literal without its brackets, lower case.
+fn host_of(rest: &str) -> Option<String> {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split_once(']')?.0
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(a)) => a.is_loopback(),
+        Ok(std::net::IpAddr::V6(a)) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        Err(_) => false,
+    }
+}
+
+fn identity_changed(name: &str, pinned: &PeerIdentity, proved: &PeerIdentity) -> String {
+    format!("`{name}` proved another identity ({proved}) than the one pinned when it was connected ({pinned}): connect it again with `replace` to trust it")
 }
 
 /// A mounted peer's interface hash: its whole tree's (the schema hash its
@@ -582,14 +752,15 @@ pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
 #[plexus_macros::activation(roles(viewer = ["peers", "names"]))]
 impl DynActivation {
     /// Connect the service at `url` (a WebSocket) as the peer `name`; a taken
-    /// name is refused unless `replace`.
+    /// name is refused unless `replace`. `wss://` anywhere, `ws://` only to
+    /// loopback (`refused`, `insecure_transport`); its identity is pinned.
     #[plexus_macros::method]
     ///
     /// `expecting` (NEST-16): an interface hash, a contract's stamp — the
     /// peer must serve exactly that interface, now and at every remount.
     pub async fn connect(&self, name: String, url: String, replace: Option<bool>, expecting: Option<String>) -> DynEvent {
-        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
-            return DynEvent::Error { message: format!("`{url}`: a peer is reached by ws:// or wss://") };
+        if let Err((reason, message)) = check_url(&url, self.inner.opts.insecure_ws) {
+            return DynEvent::Refused { reason, message };
         }
         self.add(name, PeerKind::Ws { url }, replace.unwrap_or(false), expecting).await
     }
