@@ -689,6 +689,138 @@ async fn an_onward_call_is_an_exchange() {
     relay.abort();
 }
 
+// ------------------------------------------------------------------ DYNAUTH-7
+
+/// Every `plexus::audit` tracing line this test process wrote.
+static AUDIT_LOG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+struct AuditWriter;
+impl std::io::Write for AuditWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        AUDIT_LOG.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Records(Mutex<Vec<plexus_core::plexus::peer_token::AuditRecord>>);
+impl plexus_core::plexus::peer_token::TokenAudit for Records {
+    fn record(&self, r: &plexus_core::plexus::peer_token::AuditRecord) {
+        self.0.lock().unwrap().push(r.clone());
+    }
+}
+
+/// A revoked peer's next call is refused at the host at once; a token it
+/// was already given verifies until its `exp` (≤ 60 s) and not after.
+/// Connecting it again with `replace` ends the revocation.
+async fn a_revoked_peer_is_refused_and_its_tokens_expire() {
+    use plexus_core::plexus::peer_token::{Expect, PeerKey, TokenError, Verifier, SKEW};
+    let r = rig().await;
+    let tk = PeerKey::generate();
+    let tp = free_port();
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
+    let url = format!("ws://127.0.0.1:{tp}");
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": url })).await;
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "t", "callers": ["viewer"] })).await;
+    let before = call(&r, VIEWER, "dyn.peer.t.claims", json!({})).await.remove(0);
+    let issued = before["token"].as_str().unwrap().to_string();
+    let revoked = call(&r, ADMIN, "dyn.revoke", json!({ "peer": "t", "why": "its key leaked" })).await;
+    assert_eq!(revoked[0], json!({ "type": "revoked", "peer": "t", "why": "its key leaked" }), "{revoked:?}");
+    // At once, at the host: refused (its consent gone too, so the viewer
+    // is refused at the door; the admin is refused by the revocation).
+    let next = call(&r, ADMIN, "dyn.peer.t.claims", json!({})).await;
+    assert!(next[0]["message"].as_str().is_some_and(|m| m.contains("revoked")), "{next:?}");
+    let viewer = call(&r, VIEWER, "dyn.peer.t.claims", json!({})).await;
+    assert!(viewer[0]["route_error"].is_string(), "{viewer:?}");
+    assert_eq!(peer(&r, "t").revoked.as_deref(), Some("its key leaked"));
+    // The token already issued: good until its exp, never past it.
+    let fresh = Verifier::new(tk.kid(), &r.dyn_.jwk_set()).unwrap();
+    let c = fresh.verify(&issued, &Expect::default()).unwrap();
+    assert!(c.exp - c.iat <= 60, "{c:?}");
+    let later = Verifier::new(tk.kid(), &r.dyn_.jwk_set()).unwrap();
+    assert_eq!(later.verify_at(&issued, &Expect::default(), c.exp + SKEW.as_secs() + 1), Err(TokenError::Expired), "within one token lifetime (and the skew) it is gone");
+    // No exchange for it either.
+    let again = call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": url, "replace": true })).await;
+    assert_eq!(again[0]["type"], "connected", "{again:?}");
+    assert_eq!(peer(&r, "t").revoked, None, "a new registration ends the revocation");
+    assert_eq!(call(&r, ADMIN, "dyn.peer.t.claims", json!({})).await[0]["claims"]["sub"], ADMIN);
+    t.abort();
+}
+
+/// One audit record per hop — the mint for relay, the exchange for t,
+/// joined by the call — and no token's bytes in any record or log line.
+async fn every_hop_is_audited_without_a_secret() {
+    use plexus_core::plexus::peer_token::{AuditKind, PeerKey};
+    let records = Arc::new(Records::default());
+    let sink = records.clone();
+    let r = rig_opts(None, move |o| o.audit = Some(plexus_dyn::Audit(sink))).await;
+    let (tk, rk) = (PeerKey::generate(), PeerKey::generate());
+    let (tp, rp) = (free_port(), free_port());
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims"] })).await;
+    records.0.lock().unwrap().clear();
+    let got = call(&r, USER, "dyn.peer.relay.ask", json!({})).await.remove(0);
+    let token = got["token"].as_str().unwrap().to_string();
+    let seen = records.0.lock().unwrap().clone();
+    assert_eq!(seen.iter().map(|r| r.kind).collect::<Vec<_>>(), [AuditKind::Mint, AuditKind::Exchange], "{seen:?}");
+    let (mint, exchange) = (&seen[0], &seen[1]);
+    assert_eq!((mint.sub.as_str(), mint.aud.as_str()), (USER, rk.kid()));
+    assert_eq!((exchange.sub.as_str(), exchange.aud.as_str()), (USER, tk.kid()));
+    assert_eq!(exchange.presented_call.as_deref(), Some(mint.call.as_str()), "joined by the call");
+    assert_eq!(exchange.act, [r.dyn_.issuer().kid(), rk.kid().to_string(), r.dyn_.issuer().kid()]);
+    assert!(!mint.method.is_empty() && !exchange.method.is_empty());
+    // No secret: neither the token's parts nor its signature, anywhere.
+    let text = serde_json::to_string(&seen).unwrap();
+    let log = String::from_utf8_lossy(&AUDIT_LOG.lock().unwrap()).to_string();
+    assert!(log.contains("peer token") && log.contains(&exchange.jti), "the tracing event is written: {log}");
+    for part in token.split('.') {
+        assert!(!text.contains(part), "a record holds the token's bytes");
+        assert!(!log.contains(part), "a log line holds the token's bytes");
+    }
+    t.abort();
+    relay.abort();
+}
+
+/// A rotation: the new key signs from now, the old one stays in the JWKS
+/// for one token lifetime; the key file is replaced, still 0600.
+async fn the_signing_key_rotates() {
+    use plexus_core::plexus::peer_token::{Expect, PeerKey, TokenError, Verifier};
+    let r = rig().await;
+    let tk = PeerKey::generate();
+    let tp = free_port();
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
+    let old_jwks = r.dyn_.jwk_set();
+    let old = r.dyn_.issuer().kid();
+    let rotated = call(&r, ADMIN, "dyn.rotate_key", json!({})).await;
+    assert_eq!(rotated[0]["type"], "rotated", "{rotated:?}");
+    assert_eq!(rotated[0]["previous"], old);
+    let new = rotated[0]["kid"].as_str().unwrap().to_string();
+    assert_ne!(new, old);
+    let kids: Vec<String> = r.dyn_.jwk_set().keys.iter().filter_map(|k| k.kid.clone()).collect();
+    assert_eq!(kids, [new.clone(), old.clone()], "the old key stays for one lifetime");
+    // t still trusts only the old JWKS: it refuses the new key's tokens
+    // until it fetches `dyn.jwks` again.
+    let refused = call(&r, ADMIN, "dyn.peer.t.claims", json!({})).await;
+    assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("not trusted")), "{refused:?}");
+    let v = Verifier::new(tk.kid(), &old_jwks).unwrap();
+    let issuer = r.dyn_.issuer();
+    let (tok, _) = issuer.mint(plexus_core::plexus::peer_token::MintRequest { sub: USER.into(), peer_key: Some(tk.kid().into()), name: "t".into(), scope: vec![], call: "c".into(), method: "m".into(), presented: None }).unwrap();
+    assert!(matches!(v.verify(&tok, &Expect::default()), Err(TokenError::UnknownKey(_))));
+    v.trust(&r.dyn_.jwk_set()).unwrap();
+    assert_eq!(v.verify(&tok, &Expect::default()).unwrap().iss, new);
+    // The file holds the new key.
+    let file = r.dyn_.options().data_dir.join("dyn.key");
+    assert_eq!(PeerKey::load_or_create(&file).unwrap().kid(), new);
+    t.abort();
+}
+
 /// Call the host back from inside a call; the items, or the refusal.
 async fn up(path: &str, name: &str, params: Value) -> Value {
     use plexus_client::{MethodRef, StreamItem, Transport};
@@ -1203,6 +1335,8 @@ async fn a_dendrite_without_its_launcher() {
 }
 
 fn main() {
+    // DYNAUTH-7: every `plexus::audit` line, kept for a test to read.
+    tracing_subscriber::fmt().with_env_filter("plexus::audit=info").with_writer(|| AuditWriter).with_ansi(false).init();
     // DYNAUTH-9: a secret in the host's environment (and one it means to pass).
     std::env::set_var(SECRET_ENV, "s3cret-dynauth9");
     std::env::set_var(PASSED_ENV, "given");
@@ -1233,7 +1367,10 @@ fn main() {
             a_peer_whose_key_changed_is_refused_at_remount,
             a_verifying_peer_takes_a_call_by_its_token,
             a_keyed_peer_calls_back_with_its_proof,
-            an_onward_call_is_an_exchange
+            an_onward_call_is_an_exchange,
+            a_revoked_peer_is_refused_and_its_tokens_expire,
+            every_hop_is_audited_without_a_secret,
+            the_signing_key_rotates
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });

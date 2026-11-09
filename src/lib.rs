@@ -150,6 +150,19 @@ pub struct DynOptions {
     /// DYNAUTH-12: the signing key's file (0600, made when missing); `None`:
     /// `<data_dir>/dyn.key`. Denied to every contained dendrite.
     pub key_file: Option<PathBuf>,
+    /// DYNAUTH-7: where each mint and exchange is recorded, beside the
+    /// `plexus::audit` tracing event (PRIVACY-1's sink, when there is one).
+    pub audit: Option<Audit>,
+}
+
+/// DYNAUTH-7: an audit sink for [`DynOptions::audit`].
+#[derive(Clone)]
+pub struct Audit(pub Arc<dyn plexus_core::plexus::peer_token::TokenAudit>);
+
+impl std::fmt::Debug for Audit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Audit(..)")
+    }
 }
 
 impl Default for DynOptions {
@@ -167,6 +180,7 @@ impl Default for DynOptions {
             require_consent: true,
             tokens: true,
             key_file: None,
+            audit: None,
         }
     }
 }
@@ -213,6 +227,9 @@ pub struct PeerInfo {
     /// [`DynOptions::insecure_ws`] allows.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub insecure: bool,
+    /// DYNAUTH-7: revoked (`dyn.revoke`), and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked: Option<String>,
 }
 
 /// DYNAUTH-8: who a peer proved it was — its `_info` backend and, on
@@ -297,6 +314,11 @@ pub enum DynEvent {
     /// DYNAUTH-5: what `peer` may now do: the needs it may call back up,
     /// and the roles that may call into it.
     Consented { peer: String, needs: Vec<String>, callers: Vec<String> },
+    /// DYNAUTH-7: `peer` is revoked.
+    Revoked { peer: String, why: String },
+    /// DYNAUTH-7: the signing key rotated: `kid` signs from now, `previous`
+    /// verifies for one more token lifetime.
+    Rotated { kid: String, previous: String },
     /// Why not.
     Error { message: String },
 }
@@ -381,7 +403,11 @@ fn check_name(name: &str) -> Result<(), String> {
 impl DynActivation {
     /// `dyn` with `opts`.
     pub fn new(opts: DynOptions) -> Self {
-        let issuer = Arc::new(TokenIssuer::new(Self::signing_key(&opts)));
+        let mut issuer = TokenIssuer::new(Self::signing_key(&opts));
+        if let Some(Audit(sink)) = &opts.audit {
+            issuer = issuer.with_audit(Arc::clone(sink));
+        }
+        let issuer = Arc::new(issuer);
         Self {
             inner: Arc::new(Inner {
                 opts,
@@ -401,8 +427,12 @@ impl DynActivation {
     /// DYNAUTH-12: the signing key, from its file (made there when
     /// missing). A file that cannot be read or made: an in-memory key, said
     /// loudly (tokens still verify against `dyn.jwks`, until a restart).
+    fn key_path(opts: &DynOptions) -> PathBuf {
+        opts.key_file.clone().unwrap_or_else(|| opts.data_dir.join("dyn.key"))
+    }
+
     fn signing_key(opts: &DynOptions) -> PeerKey {
-        let path = opts.key_file.clone().unwrap_or_else(|| opts.data_dir.join("dyn.key"));
+        let path = Self::key_path(opts);
         PeerKey::load_or_create(&path).unwrap_or_else(|why| {
             tracing::error!(target: "plexus::dyn", "the signing key: {why}; signing with a key kept in memory only");
             PeerKey::generate()
@@ -419,10 +449,50 @@ impl DynActivation {
         &self.inner.issuer
     }
 
+    /// DYNAUTH-7: revoke `peer` — no call is forwarded to it (no token is
+    /// minted for it), every call it is making back ends, its consent is
+    /// dropped and it stays listed as revoked until an admin connects or
+    /// grows it again with `replace`. A token already in its hand lives out
+    /// its `exp` (≤ 60 s) at a peer that verifies without asking.
+    pub fn revoke_peer(&self, peer: &str, why: &str) -> Result<(), String> {
+        let child = match self.inner.peers.lock().unwrap().get(peer) {
+            None => return Err(format!("no peer `{peer}`")),
+            Some(e) => e.child.clone(),
+        };
+        {
+            let mut store = self.inner.store.lock().unwrap();
+            store.revoked.insert(peer.to_string(), why.to_string());
+            store.consents.remove(peer);
+        }
+        self.save_store()?;
+        if let Some(c) = &child {
+            c.set_consent(Some(Vec::new()));
+            c.revoke(why);
+        }
+        self.moved();
+        tracing::warn!(target: "plexus::audit", peer = %peer, %why, "dyn revoke");
+        Ok(())
+    }
+
+    /// DYNAUTH-7: sign with a new key from now; the old one stays in
+    /// `dyn.jwks` for one token lifetime and the skew. The key file is
+    /// replaced. Answers the new key's id and the old one's.
+    pub fn rotate_signing_key(&self) -> Result<(String, String), String> {
+        let old = self.inner.issuer.kid();
+        let new = PeerKey::generate();
+        new.save(&Self::key_path(&self.inner.opts))?;
+        let kid = self.inner.issuer.rotate(new);
+        tracing::warn!(target: "plexus::audit", %kid, previous = %old, "dyn signing key rotated");
+        Ok((kid, old))
+    }
+
     /// DYNAUTH-6: [`DynActivation::exchange`]'s work.
     pub fn exchange_for(&self, subject: &str, proof: &str, audience: &str, scope: Option<&[String]>, method: &str) -> Result<(String, plexus_core::plexus::peer_token::PeerClaims), String> {
         let child = self.inner.peers.lock().unwrap().get(audience).and_then(|e| e.child.clone());
         let key = child.as_ref().and_then(|c| c.peer_key().map(str::to_string)).ok_or_else(|| format!("no connected peer `{audience}` that proved a key: a token is only exchanged for one"))?;
+        if let Some(why) = self.inner.store.lock().unwrap().revoked.get(audience) {
+            return Err(format!("`{audience}` is revoked ({why})"));
+        }
         let call = uuid::Uuid::new_v4().to_string();
         self.inner.issuer.exchange(subject, Some(proof), audience, Some(key), scope, &call, method, &self.inner.proofs).map_err(|e| format!("the exchange is refused: {e}"))
     }
@@ -759,6 +829,10 @@ impl DynActivation {
                 e.why = None;
                 drop(peers);
                 self.hold(name, &child);
+                // DYNAUTH-7: a revoked peer stays revoked across a remount.
+                if let Some(why) = self.inner.store.lock().unwrap().revoked.get(name).cloned() {
+                    child.revoke(&why);
+                }
                 if let Err(why) = self.surface(name, &child) {
                     tracing::warn!(target: "plexus::dyn", peer = %name, "{why}");
                 }
@@ -824,6 +898,13 @@ impl DynActivation {
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
                 let pin = child.identity().map(PeerIdentity::from);
+                // DYNAUTH-7: an admin connecting or growing it again is a
+                // new registration: a revocation ends here.
+                if self.inner.store.lock().unwrap().revoked.remove(&name).is_some() {
+                    if let Err(why) = self.save_store() {
+                        tracing::error!(target: "plexus::dyn", "{why}");
+                    }
+                }
                 // DYNAUTH-5: registered — its key and needs — and held to
                 // what is consented for it.
                 self.register(&name, child.peer_key());
@@ -841,6 +922,7 @@ impl DynActivation {
 
     /// The peers, listed.
     pub fn list(&self) -> Vec<PeerInfo> {
+        let revoked = self.inner.store.lock().unwrap().revoked.clone();
         self.inner
             .peers
             .lock()
@@ -869,6 +951,7 @@ impl DynActivation {
                     remounts: e.remounts,
                     identity: e.pin.clone(),
                     insecure: matches!(&e.kind, PeerKind::Ws { url } if check_url(url, false).is_err()),
+                    revoked: revoked.get(name).cloned(),
                 }
             })
             .collect()
@@ -1072,6 +1155,29 @@ impl DynActivation {
     #[plexus_macros::method]
     pub async fn consents(&self) -> impl Stream<Item = ConsentInfo> + Send + 'static {
         futures::stream::iter(self.consent_list())
+    }
+
+    /// DYNAUTH-7: revoke `peer`: nothing is forwarded to it from now (no
+    /// token minted), every call it is making back ends, its consent goes;
+    /// listed as revoked until it is connected or grown again with
+    /// `replace`. Tokens already issued expire within 60 s.
+    #[plexus_macros::method]
+    pub async fn revoke(&self, peer: String, why: Option<String>) -> DynEvent {
+        let why = why.unwrap_or_else(|| "revoked by an admin".into());
+        match self.revoke_peer(&peer, &why) {
+            Ok(()) => DynEvent::Revoked { peer, why },
+            Err(message) => DynEvent::Error { message },
+        }
+    }
+
+    /// DYNAUTH-7: rotate the signing key: a new one signs from now, the old
+    /// one stays in `dyn.jwks` for one token lifetime, then goes.
+    #[plexus_macros::method]
+    pub async fn rotate_key(&self) -> DynEvent {
+        match self.rotate_signing_key() {
+            Ok((kid, previous)) => DynEvent::Rotated { kid, previous },
+            Err(message) => DynEvent::Error { message },
+        }
     }
 
     /// DYNAUTH-6: RFC 8693 token exchange. `subject_token`, a token this

@@ -14,6 +14,8 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
 | `dyn.jwks` | public | DYNAUTH-12: the JWK Set (Ed25519, `kid` = `key:<hex>`) a peer verifies this service's tokens with |
 | `dyn.exchange { subject_token, proof, audience, scope?, method? }` | public | DYNAUTH-6: RFC 8693 token exchange — a peer's token, with its proof of possession (method `exchange`, the token's `call`), for one addressed to the connected keyed peer `audience`, its scope never wider |
+| `dyn.revoke { peer, why? }` | admin | DYNAUTH-7: nothing forwarded to it from now (no token minted), its calls back end, its consent goes; listed revoked until connected or grown again with `replace` |
+| `dyn.rotate_key` | admin | DYNAUTH-7: a new signing key from now; the old one in `dyn.jwks` for one token lifetime |
 | `dyn.consents` | viewer | each peer's key (proved at `_info`), declared needs, consented needs and callers, what is pending |
 | `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead, or be named by its consent's `callers` |
 
@@ -163,6 +165,21 @@ peer, the token minted for it is an exchange of the presented one: the
 original caller stays `sub`, `act` names each hop nearest first (`{sub:
 host, act: {sub: <presenter>, act: {sub: host}}}`), and its scope is never
 wider. `dyn.exchange` does the same as a method.
+
+## Revocation and audit (DYNAUTH-7)
+
+| what is revoked | how fast |
+| -- | -- |
+| a peer (`dyn.revoke`) | at once at the host: no call forwarded, no token minted, its calls back end. A token already in its hand verifies at a peer that does not ask for ≤ 60 s (its `exp`, plus the 30 s skew) |
+| a caller's grant | the gate's grants generation moves; calls back under its reach end (NEST-11); outstanding tokens ≤ 60 s |
+| consent (`dyn.consent`, withdrawn) | the grants generation moves; the next call back is refused |
+| the signing key (`dyn.rotate_key`) | new tokens signed by the new key at once; the old key leaves `dyn.jwks` after one lifetime and the skew; a peer must fetch `dyn.jwks` again to take the new one |
+
+Every mint and exchange writes one audit record — `iss`, `sub`, the actor
+chain, `aud`, `scope`, `call`, `jti`, `exp`, `method`, and for an exchange
+the call of the token presented (which joins one hop to the one before) —
+as a `plexus::audit` tracing event and to `DynOptions::audit`. Never the
+token, a signature or a proof.
 
 ## In a service
 
