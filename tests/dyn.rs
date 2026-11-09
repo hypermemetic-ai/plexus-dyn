@@ -371,6 +371,14 @@ async fn a_dendrite_calls_its_target_through_the_host() {
 /// (`serve_child_with`), proving its key at `_info` when it has one. The
 /// task, aborted, closes every connection.
 async fn keyed_peer(port: u16, opts: plexus_core::plexus::remote_child::ServeChild) -> tokio::task::JoinHandle<()> {
+    served_peer(port, WeatherActivation, opts).await
+}
+
+/// [`keyed_peer`] serving any activation.
+async fn served_peer<A>(port: u16, activation: A, opts: plexus_core::plexus::remote_child::ServeChild) -> tokio::task::JoinHandle<()>
+where
+    A: plexus_core::plexus::Activation + Clone + Send + Sync + 'static,
+{
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let deadline = Instant::now() + Duration::from_secs(5);
     let listener = loop {
@@ -388,6 +396,7 @@ async fn keyed_peer(port: u16, opts: plexus_core::plexus::remote_child::ServeChi
         loop {
             let Ok((tcp, _)) = listener.accept().await else { break };
             let opts = opts.clone();
+            let activation = activation.clone();
             conns.spawn(async move {
                 let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else { return };
                 let (mut sink, mut stream) = ws.split();
@@ -414,7 +423,7 @@ async fn keyed_peer(port: u16, opts: plexus_core::plexus::remote_child::ServeChi
                         }
                     }
                 };
-                let serve = plexus_core::plexus::remote_child::serve_child_with(WeatherActivation, in_r, out_w, opts);
+                let serve = plexus_core::plexus::remote_child::serve_child_with(activation, in_r, out_w, opts);
                 tokio::select! {
                     _ = async { tokio::join!(pump_in, pump_out, serve) } => {}
                 }
@@ -510,6 +519,124 @@ async fn a_peer_whose_key_changed_is_refused_at_remount() {
     let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
     assert_eq!(listed[0]["callers"], json!([]), "another key, another client: its consent dropped: {listed:?}");
     second.abort();
+}
+
+// ------------------------------------------------------------------ DYNAUTH-12
+
+/// A far side that verifies: its key, and the host's JWKS trusted.
+fn verifying(key: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core::plexus::peer_token::Jwks) -> plexus_core::plexus::remote_child::ServeChild {
+    let v = plexus_core::plexus::peer_token::Verifier::new(key.kid(), jwks).unwrap();
+    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), tokens: Some(Arc::new(v)), ..Default::default() }
+}
+
+/// A far side that verifies takes a call by the token `dyn` minted for it;
+/// one trusting another issuer, or one `dyn` mints nothing for, refuses.
+/// `dyn.jwks` is public: the current key, `kid` its id.
+async fn a_verifying_peer_takes_a_call_by_its_token() {
+    use plexus_core::plexus::peer_token::{Jwks, PeerKey};
+    let r = rig().await;
+    let jwks: Vec<Value> = items(r.host.route("dyn.jwks", json!({}), None).await).await;
+    assert_eq!(jwks[0]["keys"][0]["kty"], "OKP", "anonymous: {jwks:?}");
+    assert_eq!(jwks[0]["keys"][0]["kid"], r.dyn_.issuer().kid(), "{jwks:?}");
+    let key = PeerKey::generate();
+    let port = free_port();
+    let peer_task = keyed_peer(port, verifying(&key, &r.dyn_.jwk_set())).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{port}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    assert_eq!(call(&r, USER, "dyn.peer.v.forecast", json!({ "city": "oslo" })).await.len(), 7, "taken by its token");
+    // An anonymous caller is never forwarded (the gate), so no token is
+    // minted without a `sub`.
+    peer_task.abort();
+    // A peer trusting another issuer refuses this one's tokens.
+    let port = free_port();
+    let stranger = keyed_peer(port, verifying(&key, &Jwks { keys: vec![PeerKey::generate().jwk()] })).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "s", "url": format!("ws://127.0.0.1:{port}") })).await;
+    let refused = call(&r, USER, "dyn.peer.s.forecast", json!({ "city": "oslo" })).await;
+    assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("token is refused") && m.contains("not trusted")), "{refused:?}");
+    stranger.abort();
+    // A peer that verifies, under a `dyn` that mints no tokens: refused.
+    let r2 = rig_opts(None, |o| o.tokens = false).await;
+    let port = free_port();
+    let strict = keyed_peer(port, verifying(&key, &r2.dyn_.jwk_set())).await;
+    call(&r2, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{port}") })).await;
+    let refused = call(&r2, USER, "dyn.peer.v.forecast", json!({ "city": "oslo" })).await;
+    assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("no token")), "{refused:?}");
+    strict.abort();
+    // The signing key is kept in the data directory, 0600, and denied to dendrites.
+    let file = r.dyn_.options().data_dir.join("dyn.key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[derive(Clone)]
+pub struct RelayActivation;
+
+/// A peer that calls its host back: `rain` needs the host's peer `v`'s
+/// forecast (a graft on `dyn`, NEST-16); `sneak` reaches for `dyn.grow`,
+/// which it does not need.
+#[plexus_macros::activation(parent = DynClient)]
+impl RelayActivation {
+    /// Rainy days in `city`, asked of the host's peer `v` through the host.
+    #[plexus_macros::method(uses("dyn.peer.v.forecast"))]
+    pub async fn rain(&self, city: String) -> Value {
+        up("dyn.peer.v", "forecast", json!({ "city": city })).await
+    }
+    /// Past its needs.
+    #[plexus_macros::method]
+    pub async fn sneak(&self) -> Value {
+        up("dyn", "grow", json!({ "name": "x", "source": "", "targets": [] })).await
+    }
+}
+
+/// Call the host back from inside a call; the items, or the refusal.
+async fn up(path: &str, name: &str, params: Value) -> Value {
+    use plexus_client::{MethodRef, StreamItem, Transport};
+    let t = match plexus_core::plexus::remote_child::host() {
+        Ok(t) => t,
+        Err(e) => return json!({ "no_host": e.to_string() }),
+    };
+    let mut out = Vec::new();
+    let items: Vec<_> = t.call(MethodRef::named(path.to_string(), name.to_string()), params).collect().await;
+    for i in items {
+        match i {
+            Ok(StreamItem::Data { content, .. }) => out.push(content),
+            Ok(StreamItem::Error { message, .. }) => return json!({ "refused": message }),
+            Ok(_) => {}
+            Err(e) => return json!({ "refused": e.to_string() }),
+        }
+    }
+    json!({ "items": out.len() })
+}
+
+/// A keyed peer calls back with a proof of possession of its call's
+/// token: a consented need goes through; an unconsented one, and one past
+/// its needs, are refused.
+async fn a_keyed_peer_calls_back_with_its_proof() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let r = rig().await;
+    let (vk, rk) = (PeerKey::generate(), PeerKey::generate());
+    let (vp, rp) = (free_port(), free_port());
+    let v = keyed_peer(vp, verifying(&vk, &r.dyn_.jwk_set())).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{vp}") })).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
+    let mine = listed.iter().find(|c| c["peer"] == "relay").unwrap();
+    assert_eq!(mine["declared"], json!(["dyn.peer.v.forecast"]), "{listed:?}");
+    assert_eq!(mine["pending"], json!(["dyn.peer.v.forecast"]), "{listed:?}");
+    let before = call(&r, USER, "dyn.peer.relay.rain", json!({ "city": "oslo" })).await;
+    assert!(before[0]["refused"].as_str().is_some_and(|m| m.contains("consented")), "{before:?}");
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.v.forecast"] })).await;
+    let after = call(&r, USER, "dyn.peer.relay.rain", json!({ "city": "oslo" })).await;
+    assert_eq!(after[0], json!({ "items": 7 }), "through the host, with its proof, to v (which took its own token): {after:?}");
+    let sneak = call(&r, ADMIN, "dyn.peer.relay.sneak", json!({})).await;
+    assert!(sneak[0]["refused"].as_str().is_some_and(|m| m.contains("dyn.grow")), "past its needs, even under an admin's call: {sneak:?}");
+    v.abort();
+    relay.abort();
 }
 
 /// A WebSocket peer that answers its mount, then never reads again.
@@ -1005,7 +1132,9 @@ fn main() {
             a_grown_dendrite_is_contained,
             a_dendrite_without_its_launcher,
             a_viewer_with_consent_reaches_a_peer,
-            a_peer_whose_key_changed_is_refused_at_remount
+            a_peer_whose_key_changed_is_refused_at_remount,
+            a_verifying_peer_takes_a_call_by_its_token,
+            a_keyed_peer_calls_back_with_its_proof
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });
