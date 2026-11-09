@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+DYNAUTH-12: **peer tokens.** `dyn` signs a token for every call forwarded
+to a peer that proved a key (bound to it) and to a dendrite on its pipe
+(plexus-core's `ChildOptions::tokens`): `sub` the caller, `act` the host,
+`aud` the peer, `scope` the forwarded grant and its consented needs within
+the call's reach, ≤ 60 s. Its key is `<data_dir>/dyn.key` (0600, made when
+missing; `DynOptions::key_file`), denied to every dendrite. `dyn.jwks`
+(public) answers the JWK Set a peer verifies with. New:
+`DynOptions::{tokens, key_file}`, `DynActivation::{jwk_set, issuer}`.
+
 DYNAUTH-5: **registration and consent.** `connect` and `grow` register a
 peer: the Ed25519 key it proves at `_info` (plexus-core's `_info {nonce}`
 → `{backend, key, proof}`), pinned with its identity (`PeerIdentity::key`;

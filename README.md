@@ -12,6 +12,7 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.peers` | viewer | each peer: kind (`ws` / `dendrite`), up, why down, interface hash, restarts, open calls, calls, calls back, remounts |
 | `dyn.names` | viewer | each peer's name — the slot's list |
 | `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
+| `dyn.jwks` | public | DYNAUTH-12: the JWK Set (Ed25519, `kid` = `key:<hex>`) a peer verifies this service's tokens with |
 | `dyn.consents` | viewer | each peer's key (proved at `_info`), declared needs, consented needs and callers, what is pending |
 | `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead, or be named by its consent's `callers` |
 
@@ -135,6 +136,22 @@ named role call every method of the peer (`dyn.peer.<name>.…`, and
 `<name>.…` at the top level). Consent is kept in `<data-dir>/consent.json`
 (0600) with the key it was given for; another key is another client, and
 its consent is dropped. Every change moves the gate's grants generation.
+
+## Peer tokens (DYNAUTH-12)
+
+Every call forwarded for a signed-in caller to a peer that proved a key
+carries a token in its hop (`hop.token`): an EdDSA-signed JWT (`typ`
+`plexus-peer+jwt`) — `sub` the caller, `act` the actor chain, `aud` the
+peer's key, `cnf.jkt` its thumbprint, `scope` the forwarded grant and the
+peer's consented needs within the call's reach, `call` and `method` the
+forwarded call, `jti`, at most 60 s. A dendrite on its pipe gets one too,
+addressed `pipe:<name>` and bound to no key. A peer verifies with
+`dyn.jwks` (plexus-core's `Verifier`, `ServeChild::tokens`): the algorithm
+pinned, the audience its own, fresh, each `jti` once. Calling back under a
+key-bound token, a peer sends a proof of possession by its key for that
+method and call (plexus-core's `host()` does it); without one it is
+refused. The signing key is `<data-dir>/dyn.key` (0600), denied to every
+dendrite. A WebSocket peer that proves no key gets no token.
 
 ## In a service
 

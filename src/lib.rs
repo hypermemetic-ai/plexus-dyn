@@ -107,6 +107,7 @@ use std::time::Duration;
 
 use futures::Stream;
 use plexus_core::plexus::peer::{Peer, PeerError};
+use plexus_core::plexus::peer_token::{Jwks, PeerKey, TokenIssuer};
 use plexus_core::plexus::{ChildOptions, ChildSpec, DynamicHub, RemoteChild, ServiceRoot, WeakService};
 use schemars::JsonSchema;
 
@@ -143,6 +144,12 @@ pub struct DynOptions {
     /// admin consents (`dyn.consent`); on by default. Off: every declared
     /// need may be called, as NEST-16 has it.
     pub require_consent: bool,
+    /// DYNAUTH-12: mint a peer token for every call forwarded to a peer that
+    /// proved a key (and to a dendrite on its pipe); on by default.
+    pub tokens: bool,
+    /// DYNAUTH-12: the signing key's file (0600, made when missing); `None`:
+    /// `<data_dir>/dyn.key`. Denied to every contained dendrite.
+    pub key_file: Option<PathBuf>,
 }
 
 impl Default for DynOptions {
@@ -158,6 +165,8 @@ impl Default for DynOptions {
             insecure_ws: false,
             contain: Containment::default(),
             require_consent: true,
+            tokens: true,
+            key_file: None,
         }
     }
 }
@@ -294,6 +303,8 @@ struct Inner {
     /// DYNAUTH-5: consent (and DYNAUTH-7's revocations), kept in
     /// `<data_dir>/consent.json`.
     store: Mutex<consent::Store>,
+    /// DYNAUTH-12: the peer-token issuer (its key in `key_file`).
+    issuer: Arc<TokenIssuer>,
 }
 
 impl consent::ConsentSource for Inner {
@@ -341,6 +352,7 @@ fn check_name(name: &str) -> Result<(), String> {
 impl DynActivation {
     /// `dyn` with `opts`.
     pub fn new(opts: DynOptions) -> Self {
+        let issuer = Arc::new(TokenIssuer::new(Self::signing_key(&opts)));
         Self {
             inner: Arc::new(Inner {
                 opts,
@@ -350,9 +362,31 @@ impl DynActivation {
                 started: Default::default(),
                 top: Mutex::default(),
                 store: Mutex::new(consent::Store::default()),
+                issuer,
             }),
         }
         .loaded()
+    }
+
+    /// DYNAUTH-12: the signing key, from its file (made there when
+    /// missing). A file that cannot be read or made: an in-memory key, said
+    /// loudly (tokens still verify against `dyn.jwks`, until a restart).
+    fn signing_key(opts: &DynOptions) -> PeerKey {
+        let path = opts.key_file.clone().unwrap_or_else(|| opts.data_dir.join("dyn.key"));
+        PeerKey::load_or_create(&path).unwrap_or_else(|why| {
+            tracing::error!(target: "plexus::dyn", "the signing key: {why}; signing with a key kept in memory only");
+            PeerKey::generate()
+        })
+    }
+
+    /// DYNAUTH-12: the keys a peer verifies this `dyn`'s tokens with.
+    pub fn jwk_set(&self) -> Jwks {
+        self.inner.issuer.jwks()
+    }
+
+    /// DYNAUTH-12: the issuer (the signing key's id, its rotation, DYNAUTH-7).
+    pub fn issuer(&self) -> &Arc<TokenIssuer> {
+        &self.inner.issuer
     }
 
     /// DYNAUTH-5: the consent kept in the data directory, read at start.
@@ -604,6 +638,9 @@ impl DynActivation {
     /// The options a mount of `kind` takes.
     fn child_options(&self, kind: &PeerKind) -> ChildOptions {
         let mut o = self.inner.opts.child.clone();
+        if self.inner.opts.tokens {
+            o.tokens = Some(Arc::clone(&self.inner.issuer));
+        }
         if o.host.is_none() {
             o.host = self.inner.host.lock().unwrap().clone();
         }
@@ -818,6 +855,8 @@ impl DynActivation {
         let o = &self.inner.opts;
         let mut out = Containment::default_deny(&o.data_dir);
         out.extend(o.child.key.iter().cloned());
+        // DYNAUTH-12: the signing key, wherever it is kept.
+        out.extend(o.key_file.iter().cloned());
         out.extend(o.contain.deny.iter().cloned());
         out
     }
@@ -995,6 +1034,13 @@ impl DynActivation {
     #[plexus_macros::method]
     pub async fn consents(&self) -> impl Stream<Item = ConsentInfo> + Send + 'static {
         futures::stream::iter(self.consent_list())
+    }
+
+    /// DYNAUTH-12: the keys this service signs its peers' tokens with (a
+    /// JWK Set: Ed25519, `kid` the key's id) — public, as a JWKS is.
+    #[plexus_macros::method(public)]
+    pub async fn jwks(&self) -> Jwks {
+        self.inner.issuer.jwks()
     }
 
     /// Every peer: its kind, whether it is up, its interface's hash, its
