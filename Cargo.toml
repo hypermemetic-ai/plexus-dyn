@@ -15,8 +15,8 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 # git-ignored [patch.crates-io] in .cargo/config.toml (hyperforge build link).
 # NEST-15: 0.10.2 — the service root (`DynamicHub::root`), for `top_level`.
 plexus-core = "0.10.2"
-plexus-macros = "0.10.0"
-plexus-client = "0.10.0"
+plexus-macros = "0.11.0"
+plexus-client = "0.11.0"
 # What #[plexus_macros::activation] expands to names these crates.
 async-trait = "0.1"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }

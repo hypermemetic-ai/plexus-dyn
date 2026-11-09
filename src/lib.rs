@@ -584,7 +584,7 @@ impl DynActivation {
     }
 
     /// A peer by name: `dyn.peer.<name>.<path>.<method>`.
-    #[plexus_macros::peer(list = "names")]
+    #[plexus_macros::peer(list = names)]
     async fn peer(&self, name: &str) -> Result<Box<dyn Peer>, PeerError> {
         self.get(name).await.map(|c| Box::new(c) as Box<dyn Peer>)
     }

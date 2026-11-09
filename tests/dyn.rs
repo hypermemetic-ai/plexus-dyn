@@ -15,6 +15,9 @@
 //! - `--peers FILE`: a failing peer listed down, then up once it is;
 //! - NEST-15, `top_level`: a peer served at the host's own top level too,
 //!   gated by its own grants, gone with it; `dyn.peer.<name>` unchanged.
+//! - NEST-14: `DynClient` reaches a peer through the slot — untyped, by
+//!   method name, and typed, as the far activation's own client once the
+//!   peer's schema says it serves it (`ShapeMismatch` else).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,7 +27,8 @@ use futures::{SinkExt, Stream, StreamExt};
 use plexus_auth_core::grants::{Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef};
 use plexus_core::plexus::{AuthContext, PlexusStream, PlexusStreamItem};
 use plexus_core::DynamicHub;
-use plexus_dyn::{DynActivation, DynOptions, PeerInfo};
+use plexus_core::plexus::HubTransport;
+use plexus_dyn::{DynActivation, DynClient, DynOptions, PeerInfo};
 use serde_json::{json, Value};
 
 const ADMIN: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -464,6 +468,37 @@ async fn a_peer_grows_the_top_level() {
     stop(far).await;
 }
 
+/// NEST-14: one client, all the way down — `DynClient::peer(name)` an untyped
+/// client at `dyn.peer.<name>`, made typed below it.
+async fn dyn_client_reaches_a_peer_untyped_and_typed() {
+    let port = free_port();
+    let far = far(port, false).await;
+    let r = rig().await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://127.0.0.1:{port}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let client = DynClient::new(HubTransport::as_(r.host.clone(), who(USER)));
+    // Untyped: by name.
+    let peer = client.peer("w");
+    assert_eq!(peer.path(), "dyn.peer.w");
+    let days: Vec<_> = peer.child("weather").call("forecast", json!({ "city": "lisbon" })).collect().await;
+    assert_eq!(days.len(), 7, "{days:?}");
+    assert!(days.iter().all(|d| d.is_ok()), "{days:?}");
+    // Typed: the far activation's own client, checked against the peer's schema.
+    let weather: WeatherClient<_> = client.peer("w").into_child("weather").typed().await.expect("the peer serves weather");
+    let typed: Vec<_> = weather.forecast("lisbon".into()).collect().await;
+    assert_eq!(typed.len(), 7, "{typed:?}");
+    assert_eq!(typed[0].as_ref().unwrap()["day"], 0);
+    // Not what the peer serves: refused by shape, nothing else called.
+    match client.peer("w").into_child("weather").typed::<ExtraClient<_>>().await {
+        Err(plexus_client::ClientError::ShapeMismatch { methods, .. }) => assert_eq!(methods, vec!["new_thing".to_string()]),
+        other => panic!("{other:?}"),
+    }
+    // A name that is not a route segment sends nothing.
+    let bad: Vec<_> = client.peer("No Such").call("x", json!({})).collect().await;
+    assert!(matches!(bad.as_slice(), [Err(plexus_client::ClientError::InvalidName { .. })]), "{bad:?}");
+    stop(far).await;
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(async {
@@ -479,7 +514,8 @@ fn main() {
             a_silent_peer_is_marked_down,
             a_live_peer_stays_up_through_its_pings,
             the_peers_file_is_connected_at_start,
-            a_peer_grows_the_top_level
+            a_peer_grows_the_top_level,
+            dyn_client_reaches_a_peer_untyped_and_typed
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });
