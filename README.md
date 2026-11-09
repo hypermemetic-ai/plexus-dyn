@@ -11,7 +11,9 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.disconnect { name }` | admin | let go |
 | `dyn.peers` | viewer | each peer: kind (`ws` / `dendrite`), up, why down, interface hash, restarts, open calls, calls, calls back, remounts |
 | `dyn.names` | viewer | each peer's name — the slot's list |
-| `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead |
+| `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
+| `dyn.consents` | viewer | each peer's key (proved at `_info`), declared needs, consented needs and callers, what is pending |
+| `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead, or be named by its consent's `callers` |
 
 **Grafts** (NEST-16): every connect, grow and remount reads the peer's
 `needs` (what it calls of this service: a graft written with `parent =
@@ -114,6 +116,26 @@ launcher is not found, with `env -i` and a warning.
 `contain.require` refuses to start one that cannot be contained instead.
 The network is not restricted.
 
+## Registration and consent (DYNAUTH-5)
+
+`connect` and `grow` register each peer as a client: the Ed25519 key it
+proves at `_info` (a nonce signed; plexus-core's `ServeChild::key` on the
+far side) — pinned with its identity, so a remount proving another key is
+refused (`identity_changed`) until `connect … replace` — and the `needs` its
+schema declares. A dendrite on its pipe proves no key: the pipe is the
+host's own.
+
+Declared needs are a request. Until an admin answers it with `dyn.consent`
+every one is refused upward (`forbidden`, `not_needed`, "no admin has
+consented to it"); `DynOptions::require_consent = false` restores NEST-16's
+rule (declared is enough). A consent names only needs the peer declares; a
+`method@scope` need is reached only on that scope. `callers` are roles: a
+service that hands its gate `dyn.consent_roles(roles)` lets a holder of a
+named role call every method of the peer (`dyn.peer.<name>.…`, and
+`<name>.…` at the top level). Consent is kept in `<data-dir>/consent.json`
+(0600) with the key it was given for; another key is another client, and
+its consent is dropped. Every change moves the gate's grants generation.
+
 ## In a service
 
 ```rust
@@ -123,7 +145,9 @@ let dyn_ = plexus_dyn::DynActivation::new(plexus_dyn::DynOptions {
     peers_file: Some("peers.toml".into()),
     ..Default::default()
 });
-let service = Arc::new(DynamicHub::new("svc").register(dyn_.clone()));
+// DYNAUTH-5: the gate's roles, plus what consent gives a role.
+let gate = Gate::new(members, dyn_.consent_roles(Arc::new(roles)), resolve);
+let service = Arc::new(DynamicHub::new("svc").register(dyn_.clone()).with_gate(Arc::new(gate)));
 dyn_.start(&service).await?; // the --peers file, the liveness task, the service dendrites call back through
 ```
 
@@ -159,7 +183,12 @@ another key until it is connected again; a contained
 dendrite refused a key file, another dendrite's file and `~/.plexus/keys`,
 seeing none of the host's environment, reading and writing its own
 directory; one whose launcher is missing refused when containment is
-required, else run with a cleared environment. The dendrite needs
+required, else run with a cleared environment; a viewer reaching a peer
+only once its role is consented, a consent beyond what is declared refused,
+a dendrite's call back refused until its need is consented; a peer proving
+its key at `_info` (plexus-core's far side over a WebSocket), refused at a
+remount under another key, and its consent dropped when connected again
+under it. The dendrite needs
 `plexus-dendrite` (the sibling checkout, or `PLEXUS_DENDRITE`) and Node 22.
 
 ## Rough

@@ -187,7 +187,8 @@ async fn rig_opts(peers_file: Option<PathBuf>, tweak: impl FnOnce(&mut DynOption
     for (p, r) in [(ADMIN, "admin"), (USER, "user"), (VIEWER, "viewer"), (DIGEST_ONLY, "digest_only"), (TOP, "top")] {
         members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::Everywhere });
     }
-    let gate = Arc::new(Gate::new(members, Arc::new(roles), Arc::new(Everywhere)));
+    // DYNAUTH-5: the roles, plus what consent gives a role.
+    let gate = Arc::new(Gate::new(members, dyn_.consent_roles(Arc::new(roles)), Arc::new(Everywhere)));
     let host = Arc::new(DynamicHub::new("host").register(dyn_.clone()).with_gate(gate));
     dyn_.start(&host).await.unwrap();
     Rig { host, dyn_, _data: data }
@@ -342,10 +343,16 @@ async fn a_dendrite_calls_its_target_through_the_host() {
     let grown = call(&r, ADMIN, "dyn.grow", json!({ "name": "digest", "source": DIGEST, "targets": ["w.weather"] })).await;
     assert_eq!(grown[0]["type"], "connected", "{grown:?}");
     assert_eq!(grown[0]["methods"], json!(["rainy"]), "{grown:?}");
+    // DYNAUTH-5: what it declares it needs is a request; until an admin
+    // consents, its call back is refused, saying so.
+    let unconsented = call(&r, USER, "dyn.peer.digest.rainy", json!({ "city": "lisbon" })).await;
+    assert!(format!("{unconsented:?}").contains("consented"), "{unconsented:?}");
+    let ok = call(&r, ADMIN, "dyn.consent", json!({ "peer": "digest", "needs": ["dyn.peer.w.weather.forecast"] })).await;
+    assert_eq!(ok[0]["type"], "consented", "{ok:?}");
     let got = call(&r, USER, "dyn.peer.digest.rainy", json!({ "city": "lisbon" })).await;
     assert_eq!(got[0], json!({ "rain_days": rainy_days("lisbon") }), "{got:?}");
     let d = peer(&r, "digest");
-    assert_eq!((d.calls_back, d.up), (2, true), "its target's schema at its start, then one call back: {d:?}");
+    assert_eq!((d.calls_back, d.up), (2, true), "its target's schema at its start, then one call back taken (a refused one is not made): {d:?}");
     assert!(matches!(d.peer, plexus_dyn::PeerKind::Dendrite { .. }), "{d:?}");
     // As the caller: one holding `dyn.peer.digest.rainy` alone reaches the
     // dendrite, and its call back to `w` is refused by the host's gate.
@@ -356,6 +363,153 @@ async fn a_dendrite_calls_its_target_through_the_host() {
     let refused = call(&r, VIEWER, "dyn.peer.digest.rainy", json!({ "city": "lisbon" })).await;
     assert!(refused[0]["route_error"].is_string(), "{refused:?}");
     stop(far).await;
+}
+
+// ------------------------------------------------------------------ DYNAUTH-5
+
+/// A WebSocket peer serving `WeatherActivation` as plexus-core's far side
+/// (`serve_child_with`), proving its key at `_info` when it has one. The
+/// task, aborted, closes every connection.
+async fn keyed_peer(port: u16, opts: plexus_core::plexus::remote_child::ServeChild) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let listener = loop {
+        match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(l) => break l,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("port {port}: {e}"),
+        }
+    };
+    tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else { break };
+            let opts = opts.clone();
+            conns.spawn(async move {
+                let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else { return };
+                let (mut sink, mut stream) = ws.split();
+                let (mut in_w, in_r) = tokio::io::duplex(1 << 20);
+                let (out_w, out_r) = tokio::io::duplex(1 << 20);
+                let pump_in = async move {
+                    while let Some(Ok(m)) = stream.next().await {
+                        match m {
+                            tokio_tungstenite::tungstenite::Message::Text(t) => {
+                                if in_w.write_all(t.as_bytes()).await.is_err() || in_w.write_all(b"\n").await.is_err() {
+                                    break;
+                                }
+                            }
+                            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                };
+                let pump_out = async move {
+                    let mut lines = tokio::io::BufReader::new(out_r).lines();
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        if sink.send(tokio_tungstenite::tungstenite::Message::text(l)).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let serve = plexus_core::plexus::remote_child::serve_child_with(WeatherActivation, in_r, out_w, opts);
+                tokio::select! {
+                    _ = async { tokio::join!(pump_in, pump_out, serve) } => {}
+                }
+            });
+        }
+    })
+}
+
+fn keyed(key: &plexus_core::plexus::peer_token::PeerKey) -> plexus_core::plexus::remote_child::ServeChild {
+    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), ..Default::default() }
+}
+
+/// A viewer reaches a peer once an admin consents to its role calling it;
+/// before, and after the consent is withdrawn, it is refused naming the
+/// grant. The slot grant stays the admin's.
+async fn a_viewer_with_consent_reaches_a_peer() {
+    let port = free_port();
+    let far = far(port, false).await;
+    let r = rig().await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://127.0.0.1:{port}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let refused = call(&r, VIEWER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await;
+    let why = refused[0]["route_error"].as_str().unwrap_or_default().to_string();
+    assert!(why.contains("dyn.{peer}") || why.contains("dyn.peer.w.weather.forecast"), "forbidden, naming the grant: {refused:?}");
+    // Consent: the viewer role may call it.
+    let ok = call(&r, ADMIN, "dyn.consent", json!({ "peer": "w", "callers": ["viewer"] })).await;
+    assert_eq!(ok[0], json!({ "type": "consented", "peer": "w", "needs": [], "callers": ["viewer"] }), "{ok:?}");
+    assert_eq!(call(&r, VIEWER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    // Only an admin consents.
+    let refused = call(&r, VIEWER, "dyn.consent", json!({ "peer": "w", "callers": ["viewer"] })).await;
+    assert!(refused[0]["route_error"].as_str().is_some_and(|e| e.contains("dyn.consent")), "{refused:?}");
+    // Listed: no key (a full service proves none), nothing declared.
+    let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
+    assert_eq!(listed[0]["peer"], "w", "{listed:?}");
+    assert_eq!(listed[0]["callers"], json!(["viewer"]), "{listed:?}");
+    // Kept in the data directory, 0600.
+    let file = r.dyn_.options().data_dir.join("consent.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    // Withdrawn: refused again.
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "w" })).await;
+    let refused = call(&r, VIEWER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await;
+    assert!(refused[0]["route_error"].is_string(), "{refused:?}");
+    // A consent to a need it does not declare is refused.
+    let wider = call(&r, ADMIN, "dyn.consent", json!({ "peer": "w", "needs": ["dyn.grow"] })).await;
+    assert!(wider[0]["message"].as_str().is_some_and(|m| m.contains("dyn.grow") && m.contains("does not declare")), "{wider:?}");
+    stop(far).await;
+}
+
+/// A peer proves its key at `_info`; it is registered and pinned, and a
+/// remount proving another key is refused until `connect … replace` — which
+/// registers a new client, so its consent is dropped.
+async fn a_peer_whose_key_changed_is_refused_at_remount() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let port = free_port();
+    let url = format!("ws://127.0.0.1:{port}");
+    let (one, two) = (PeerKey::generate(), PeerKey::generate());
+    let first = keyed_peer(port, keyed(&one)).await;
+    let r = rig().await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "k", "url": url })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let p = peer(&r, "k");
+    assert_eq!(p.identity.as_ref().and_then(|i| i.key.as_deref()), Some(one.kid()), "registered: {p:?}");
+    assert_eq!(call(&r, USER, "dyn.peer.k.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "k", "callers": ["viewer"] })).await;
+    let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
+    assert_eq!(listed[0]["key"], one.kid(), "{listed:?}");
+    // A peer that names a key it cannot prove is refused at connect.
+    // (Another key restarts on the same port.)
+    first.abort();
+    let _ = first.await;
+    let second = keyed_peer(port, keyed(&two)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = call(&r, USER, "dyn.peer.k.forecast", json!({ "city": "oslo" })).await;
+        let p = peer(&r, "k");
+        if p.why.as_deref().is_some_and(|w| w.contains("identity") || w.contains("another")) {
+            assert!(got.len() < 7 && !p.up, "{got:?} {p:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "a new key was never refused: {got:?} {p:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let p = peer(&r, "k");
+    assert!(!p.up && p.identity.as_ref().and_then(|i| i.key.as_deref()) == Some(one.kid()), "still pinned to the first key: {p:?}");
+    let again = call(&r, ADMIN, "dyn.connect", json!({ "name": "k", "url": url, "replace": true })).await;
+    assert_eq!(again[0]["type"], "connected", "{again:?}");
+    assert_eq!(peer(&r, "k").identity.and_then(|i| i.key), Some(two.kid().to_string()), "re-registered");
+    let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
+    assert_eq!(listed[0]["callers"], json!([]), "another key, another client: its consent dropped: {listed:?}");
+    second.abort();
 }
 
 /// A WebSocket peer that answers its mount, then never reads again.
@@ -849,7 +1003,9 @@ fn main() {
             the_insecure_override_is_said,
             a_wss_peer_is_validated_and_its_key_pinned,
             a_grown_dendrite_is_contained,
-            a_dendrite_without_its_launcher
+            a_dendrite_without_its_launcher,
+            a_viewer_with_consent_reaches_a_peer,
+            a_peer_whose_key_changed_is_refused_at_remount
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });

@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+DYNAUTH-5: **registration and consent.** `connect` and `grow` register a
+peer: the Ed25519 key it proves at `_info` (plexus-core's `_info {nonce}`
+→ `{backend, key, proof}`), pinned with its identity (`PeerIdentity::key`;
+a remount proving another key is refused, `identity_changed`), and its
+declared `needs`. `dyn.consent { peer, needs, callers }` (admin): the needs
+it may call back up (`method` or `method@scope`, a subset of what it
+declares) and the roles that may call into it; `dyn.consents` (viewer)
+lists each peer's key, declared needs, consent and what is pending. A
+declared need not consented is refused upward (`DynOptions::require_consent`,
+on by default). `DynActivation::consent_roles(roles)` wraps the service's
+roles so a consented role reaches `dyn.peer.<name>.…`; `dyn.{peer}` stays
+the admin's. Kept in `<data_dir>/consent.json` (0600) with the key it was
+given for; a peer connected again under another key loses it. New:
+`consent` (`Consent`, `ConsentInfo`, `ConsentRoles`),
+`DynEvent::Consented`, `DynOptions::require_consent`.
+
 DYNAUTH-8 (TM-3): **transport hardening.** `ws://` only to loopback;
 `wss://` beyond it, certificates validated (plexus-core's `child-wss`, with
 `ChildOptions::tls_roots` for more CAs); `DynOptions::insecure_ws` allows a
