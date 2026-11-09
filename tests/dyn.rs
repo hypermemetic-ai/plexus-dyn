@@ -15,6 +15,9 @@
 //! - `--peers FILE`: a failing peer listed down, then up once it is;
 //! - NEST-15, `top_level`: a peer served at the host's own top level too,
 //!   gated by its own grants, gone with it; `dyn.peer.<name>` unchanged.
+//! - NEST-16: `connect --expecting <stamp>` refuses a peer whose interface
+//!   differs, at connect and at a remount; a dendrite declaring needs this
+//!   service does not serve is refused at `grow`, naming them;
 //! - NEST-14: `DynClient` reaches a peer through the slot — untyped, by
 //!   method name, and typed, as the far activation's own client once the
 //!   peer's schema says it serves it (`ShapeMismatch` else).
@@ -499,6 +502,61 @@ async fn dyn_client_reaches_a_peer_untyped_and_typed() {
     stop(far).await;
 }
 
+/// NEST-16: `expecting` — an interface hash the peer must serve: at
+/// connect, and again at every remount.
+async fn connect_expecting_refuses_another_interface() {
+    use plexus_core::plexus::peer::Interface;
+    use plexus_core::plexus::Activation;
+    let weather = Interface::named("weather", &WeatherActivation.plugin_schema()).hash;
+    let extra = Interface::named("extra", &ExtraActivation.plugin_schema()).hash;
+    let port = free_port();
+    let far = far(port, false).await;
+    let r = rig().await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url, "expecting": weather })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let refused = call(&r, ADMIN, "dyn.connect", json!({ "name": "x", "url": url, "expecting": extra })).await;
+    assert_eq!(refused[0]["type"], "error", "{refused:?}");
+    let why = refused[0]["message"].as_str().unwrap();
+    assert!(why.contains("does not serve the interface") && why.contains(&extra) && why.contains(&weather), "{why}");
+    assert_eq!(call(&r, VIEWER, "dyn.names", json!({})).await, [json!("w")], "nothing kept of the refused one");
+    stop(far).await;
+    // At a remount: `e` expects `extra`; the far side comes back without it.
+    let port = free_port();
+    let far = self::far(port, true).await;
+    let url = format!("ws://127.0.0.1:{port}");
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "e", "url": url, "expecting": extra })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    stop(far).await;
+    let far = self::far(port, false).await;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        // A call notices the schema moved; the next look tries the remount.
+        let _ = call(&r, USER, "dyn.peer.e.weather.forecast", json!({ "city": "lisbon" })).await;
+        let p = peer(&r, "e");
+        if p.why.as_deref().is_some_and(|w| w.contains("does not serve the interface")) {
+            assert!(!p.up, "{p:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the remount was not refused: {p:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    stop(far).await;
+}
+
+/// NEST-16: a dendrite says what it calls of this service (read from its
+/// code, or declared); `grow` refuses one whose needs this service does not
+/// serve, naming them.
+async fn a_dendrite_whose_needs_are_not_served_is_refused() {
+    let r = rig().await;
+    let source = "export const needs = [\"shop.items\"];\n/** Hello. */\nexport async function hello() { return { hi: true }; }\n";
+    let got = call(&r, ADMIN, "dyn.grow", json!({ "name": "stocker", "source": source, "targets": [] })).await;
+    assert_eq!(got[0]["type"], "error", "{got:?}");
+    let why = got[0]["message"].as_str().unwrap();
+    assert!(why.contains("shop.items") && why.contains("stocker"), "{why}");
+    assert!(r.dyn_.list().is_empty());
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(async {
@@ -515,7 +573,9 @@ fn main() {
             a_live_peer_stays_up_through_its_pings,
             the_peers_file_is_connected_at_start,
             a_peer_grows_the_top_level,
-            dyn_client_reaches_a_peer_untyped_and_typed
+            dyn_client_reaches_a_peer_untyped_and_typed,
+            connect_expecting_refuses_another_interface,
+            a_dendrite_whose_needs_are_not_served_is_refused
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });

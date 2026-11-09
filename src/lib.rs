@@ -5,8 +5,8 @@
 //! as a peer in one untyped slot:
 //!
 //! ```text
-//! dyn.connect   { name, url, replace? }      a service on a WebSocket, as a peer        (admin)
-//! dyn.grow      { name, source, targets }    a dendrite: index.ts, served on stdio      (admin)
+//! dyn.connect   { name, url, replace?, expecting? }   a service on a WebSocket, as a peer (admin)
+//! dyn.grow      { name, source, targets, expecting? } a dendrite: index.ts, on stdio      (admin)
 //! dyn.disconnect { name }                                                                (admin)
 //! dyn.peers                                  each peer: kind, up, interface, counters    (viewer)
 //! dyn.names                                  each peer's name: the slot's list            (viewer)
@@ -40,6 +40,16 @@
 //! gated as a mounted child is: each method on its own grant
 //! (`w.weather.forecast`), admin's unless a role lists it — not the slot's
 //! `dyn.{peer}`.
+//!
+//! **Grafts** (NEST-16). Every connect, grow and remount is checked before
+//! the peer is served: a peer whose schema declares `needs` (what it calls
+//! of this service — a graft that knows its parent, or a dendrite calling
+//! back through `--via-host`) is refused unless this service serves each, by
+//! its shape hash, naming every one missing or changed. **`expecting`** is a
+//! contract's stamp (the interface hash: `ForgeClient::stamp().hash`, or
+//! `Interface::named(…).hash`): the peer — its root or one of its
+//! activations — must serve exactly that interface, at connect and at every
+//! remount; otherwise it is refused (a remount keeps the mount it had).
 //!
 //! **`--peers FILE`** ([`DynOptions::peers_file`]): a TOML of peers connected
 //! at [`DynActivation::start`]; one that fails is listed down, never dropped,
@@ -157,6 +167,8 @@ struct Entry {
     child: Option<RemoteChild>,
     why: Option<String>,
     remounts: u64,
+    /// NEST-16: the interface hash the peer must serve.
+    expecting: Option<String>,
 }
 
 struct Inner {
@@ -228,7 +240,7 @@ impl DynActivation {
         }
         if let Some(file) = &self.inner.opts.peers_file {
             for (name, kind) in read_peers_file(file)? {
-                self.inner.peers.lock().unwrap().insert(name, Entry { kind, child: None, why: Some("not connected yet".into()), remounts: 0 });
+                self.inner.peers.lock().unwrap().insert(name, Entry { kind, child: None, why: Some("not connected yet".into()), remounts: 0, expecting: None });
             }
             let names: Vec<String> = self.inner.peers.lock().unwrap().keys().cloned().collect();
             for name in names {
@@ -368,18 +380,22 @@ impl DynActivation {
     /// listed whatever happens.
     async fn mount(&self, name: &str, remount: bool) -> Result<RemoteChild, String> {
         let _g = self.inner.dialing.lock().await;
-        let kind = match self.inner.peers.lock().unwrap().get(name) {
+        let (kind, expecting) = match self.inner.peers.lock().unwrap().get(name) {
             Some(e) => {
                 // Mounted (or remounted) meanwhile by another look or call.
                 if let Some(c) = e.child.as_ref().filter(|c| c.dead().is_none()) {
                     return Ok(c.clone());
                 }
-                e.kind.clone()
+                (e.kind.clone(), e.expecting.clone())
             }
             None => return Err(format!("no peer `{name}`")),
         };
         let spec = self.spec(name, &kind)?;
-        let mounted = RemoteChild::connect(spec, self.child_options(&kind)).await.map_err(|e| e.to_string());
+        // NEST-16: the remount is the same graft: checked again.
+        let mounted = match RemoteChild::connect(spec, self.child_options(&kind)).await {
+            Ok(child) => self.vet(name, &child, expecting.as_deref()).map(|_| child),
+            Err(e) => Err(e.to_string()),
+        };
         let mut peers = self.inner.peers.lock().unwrap();
         let Some(e) = peers.get_mut(name) else { return Err(format!("`{name}` was disconnected while it was mounted")) };
         match mounted {
@@ -406,8 +422,30 @@ impl DynActivation {
         }
     }
 
+    /// NEST-16: may `child` be served as `name` here — its `needs` all
+    /// served by this service (by shape), and, when `expecting` names an
+    /// interface hash, that interface served by the peer's root or one of
+    /// its activations.
+    fn vet(&self, name: &str, child: &RemoteChild, expecting: Option<&str>) -> Result<(), String> {
+        if let Some(want) = expecting {
+            let served = served_interfaces(child);
+            if !served.iter().any(|(_, h)| h == want) {
+                let got: Vec<String> = served.iter().map(|(at, h)| format!("{at} {h}")).collect();
+                return Err(format!("`{name}` does not serve the interface it is expected to ({want}): it serves {}", got.join(", ")));
+            }
+        }
+        if let Some(needs) = child.needs() {
+            let service = self.inner.host.lock().unwrap().as_ref().and_then(WeakService::upgrade);
+            match service {
+                Some(service) => service.check_needs(name, needs).map_err(|m| m.to_string())?,
+                None => return Err(format!("`{name}` needs {} of its service, which is not known yet: start `dyn` in its service first", needs.iter().map(|n| n.method.as_str()).collect::<Vec<_>>().join(", "))),
+            }
+        }
+        Ok(())
+    }
+
     /// Add (or replace) a peer and mount it; on failure nothing is kept.
-    async fn add(&self, name: String, kind: PeerKind, replace: bool) -> DynEvent {
+    async fn add(&self, name: String, kind: PeerKind, replace: bool, expecting: Option<String>) -> DynEvent {
         if let Err(message) = check_name(&name) {
             return DynEvent::Error { message };
         }
@@ -427,10 +465,13 @@ impl DynActivation {
         // schemas of the peers it targets — which may need mounting.
         match RemoteChild::connect(spec, self.child_options(&kind)).await {
             Ok(child) => {
+                if let Err(message) = self.vet(&name, &child, expecting.as_deref()) {
+                    return DynEvent::Error { message };
+                }
                 let schema = plexus_core::plexus::Activation::plugin_schema(&child);
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
-                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0 });
+                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting });
                 if let Err(message) = self.surface(&name, &child) {
                     self.inner.peers.lock().unwrap().remove(&name);
                     return DynEvent::Error { message };
@@ -453,6 +494,8 @@ impl DynActivation {
                 let up = e.child.as_ref().is_some_and(RemoteChild::is_up);
                 let why = match (&e.child, up) {
                     (_, true) => None,
+                    // A remount refused (NEST-16) says why, over the dead mount's own reason.
+                    (Some(c), false) if c.dead().is_some() && e.why.is_some() => e.why.clone(),
                     (Some(c), false) => c.why_down().or_else(|| e.why.clone()),
                     (None, false) => e.why.clone(),
                 };
@@ -497,6 +540,19 @@ fn interface_of(child: &RemoteChild) -> String {
     plexus_core::plexus::content_hash::hash16(child.mounted_hash().as_bytes())
 }
 
+/// NEST-16: the interfaces a mounted peer serves — its root's and each of
+/// its activations' (its static children's), by path, each `Interface`'s
+/// hash (of its methods' shapes, whatever it is mounted as).
+fn served_interfaces(child: &RemoteChild) -> Vec<(String, String)> {
+    use plexus_core::plexus::peer::Interface;
+    use plexus_core::plexus::Activation;
+    let mut out = vec![("(root)".to_string(), Interface::named(child.name(), &child.plugin_schema()).hash)];
+    for (path, schema) in child.static_child_schemas() {
+        out.push((path.clone(), Interface::named(&path, &schema).hash));
+    }
+    out
+}
+
 /// `--peers FILE`: `name = "ws://…"`, or `[name] dendrite = "DIR", via = […]`
 /// (a relative `DIR` is the file's own directory's).
 pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
@@ -528,18 +584,23 @@ impl DynActivation {
     /// Connect the service at `url` (a WebSocket) as the peer `name`; a taken
     /// name is refused unless `replace`.
     #[plexus_macros::method]
-    pub async fn connect(&self, name: String, url: String, replace: Option<bool>) -> DynEvent {
+    ///
+    /// `expecting` (NEST-16): an interface hash, a contract's stamp — the
+    /// peer must serve exactly that interface, now and at every remount.
+    pub async fn connect(&self, name: String, url: String, replace: Option<bool>, expecting: Option<String>) -> DynEvent {
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
             return DynEvent::Error { message: format!("`{url}`: a peer is reached by ws:// or wss://") };
         }
-        self.add(name, PeerKind::Ws { url }, replace.unwrap_or(false)).await
+        self.add(name, PeerKind::Ws { url }, replace.unwrap_or(false), expecting).await
     }
 
     /// Grow a dendrite: `source` (its `index.ts`) served as the peer `name`,
     /// its clients grown toward `targets` (other peers, `weather` or
     /// `weather.forecasts`, each called back through this service).
     #[plexus_macros::method]
-    pub async fn grow(&self, name: String, source: String, targets: Vec<String>, replace: Option<bool>) -> DynEvent {
+    ///
+    /// `expecting` (NEST-16): as `connect`'s.
+    pub async fn grow(&self, name: String, source: String, targets: Vec<String>, replace: Option<bool>, expecting: Option<String>) -> DynEvent {
         if let Err(message) = check_name(&name) {
             return DynEvent::Error { message };
         }
@@ -553,7 +614,7 @@ impl DynActivation {
         if let Err(e) = tokio::fs::write(dir.join("index.ts"), source).await {
             return DynEvent::Error { message: format!("{}: {e}", dir.display()) };
         }
-        self.add(name, PeerKind::Dendrite { dir: dir.display().to_string(), via: targets }, replace.unwrap_or(false)).await
+        self.add(name, PeerKind::Dendrite { dir: dir.display().to_string(), via: targets }, replace.unwrap_or(false), expecting).await
     }
 
     /// Let go of the peer `name` (a dendrite's process ends with its last call).

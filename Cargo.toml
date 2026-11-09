@@ -13,8 +13,9 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 # liveness and remount hooks). Every Plexus crate by published version, so a
 # clone of plexus-dyn alone builds; developing against sibling checkouts is a
 # git-ignored [patch.crates-io] in .cargo/config.toml (hyperforge build link).
-# NEST-15: 0.10.2 — the service root (`DynamicHub::root`), for `top_level`.
-plexus-core = "0.10.2"
+# NEST-15: the service root (`DynamicHub::root`), for `top_level`; NEST-16:
+# 0.11.0 — needs checked at a graft, `Parent`, the narrowed calls back.
+plexus-core = "0.11.0"
 plexus-macros = "0.11.0"
 plexus-client = "0.11.0"
 # What #[plexus_macros::activation] expands to names these crates.
