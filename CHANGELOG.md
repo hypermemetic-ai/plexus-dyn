@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+NEST-21: **settings and re-pinning.** `dyn` reads the service's
+configuration (plexus-core's `config`; `DynOptions::config`, else the
+service's at `start`) at every connect, mount and spawn:
+`transport.insecure_ws`, `transport.tls_roots`, `child.*`, and its own
+(`plexus_dyn::settings`) `dyn.repin_on_valid_cert` (default false, NEST-18
+D33; critical), `dyn.containment.deny` (adds only), `dyn.containment.require`
+(critical), `dyn.require_consent` (critical; mounted peers held again when
+it moves). The options' values are the flag layer. `dyn.pins` (viewer):
+each peer's pinned identity and fingerprint, and the identity it presented
+and was refused for. `dyn.repin { name, fingerprint }` (admin): pins the
+presented identity only when `fingerprint` is its
+(`PeerIdentity::fingerprint`, `sha256:` over backend, certificate key and
+key); else `refused` `fingerprint_mismatch` (or `not_presented`) with `old`
+and `presented`. New: `PinInfo`, `PeerInfo::presented`,
+`DynEvent::Repinned`, `DynEvent::Refused { old, presented }`,
+`Refusal::{FingerprintMismatch, NotPresented}`.
+
 DYNAUTH-7: **revocation and audit.** `dyn.revoke { peer, why? }` (admin):
 nothing is forwarded to it from now (no token minted), its calls back end,
 its consent goes, and it stays listed as revoked (`PeerInfo::revoked`,
