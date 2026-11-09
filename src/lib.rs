@@ -10,8 +10,19 @@
 //! dyn.disconnect { name }                                                                (admin)
 //! dyn.peers                                  each peer: kind, up, interface, counters    (viewer)
 //! dyn.names                                  each peer's name: the slot's list            (viewer)
+//! dyn.consent   { peer, needs?, callers? }   what a peer may call up; who may call it    (admin)
+//! dyn.consents                               each peer's key, declared needs, consent     (viewer)
 //! dyn.peer.<name>.<path>.<method>            a call into a peer, gated by `dyn.{peer}`
+//!                                            or a role its consent names
 //! ```
+//!
+//! **Registration and consent** (DYNAUTH-5, [`consent`]): a peer's key
+//! (proved at `_info`) and its declared `needs` are registered at connect
+//! and grow, the key pinned. Its needs are a request: an admin answers with
+//! `dyn.consent`, and a declared need not consented is refused upward. A
+//! consent's `callers` are roles whose holders may call into the peer,
+//! through [`DynActivation::consent_roles`] — the roles a service hands its
+//! gate.
 //!
 //! Every peer is a plexus-core [`RemoteChild`]: a WebSocket peer dialed with
 //! [`ChildSpec::Ws`], a dendrite spawned as `plexus-dendrite serve DIR
@@ -86,6 +97,8 @@
 //! ```
 
 pub mod contain;
+// DYNAUTH-5: a peer's registration and an admin's consent.
+pub mod consent;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -97,6 +110,7 @@ use plexus_core::plexus::peer::{Peer, PeerError};
 use plexus_core::plexus::{ChildOptions, ChildSpec, DynamicHub, RemoteChild, ServiceRoot, WeakService};
 use schemars::JsonSchema;
 
+pub use consent::{Consent, ConsentInfo, ConsentRoles};
 pub use contain::Containment;
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +139,10 @@ pub struct DynOptions {
     pub insecure_ws: bool,
     /// DYNAUTH-9: how a dendrite is contained.
     pub contain: Containment,
+    /// DYNAUTH-5: a peer's declared needs are called back only once an
+    /// admin consents (`dyn.consent`); on by default. Off: every declared
+    /// need may be called, as NEST-16 has it.
+    pub require_consent: bool,
 }
 
 impl Default for DynOptions {
@@ -139,6 +157,7 @@ impl Default for DynOptions {
             top_level: false,
             insecure_ws: false,
             contain: Containment::default(),
+            require_consent: true,
         }
     }
 }
@@ -194,11 +213,14 @@ pub struct PeerIdentity {
     pub backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key: Option<String>,
+    /// DYNAUTH-5: the Ed25519 key it proved at `_info` (`key:<hex>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl From<&plexus_core::plexus::PeerIdentity> for PeerIdentity {
     fn from(p: &plexus_core::plexus::PeerIdentity) -> Self {
-        Self { backend: p.backend.clone(), tls_key: p.tls_key.clone() }
+        Self { backend: p.backend.clone(), tls_key: p.tls_key.clone(), key: p.key.clone() }
     }
 }
 
@@ -208,6 +230,10 @@ impl std::fmt::Display for PeerIdentity {
         match &self.tls_key {
             Some(k) => write!(f, ", TLS key {}", &k[..k.len().min(16)]),
             None => write!(f, ", no TLS key"),
+        }?;
+        match &self.key {
+            Some(k) => write!(f, ", key {}", &k[..k.len().min(20)]),
+            None => Ok(()),
         }
     }
 }
@@ -232,6 +258,9 @@ pub enum DynEvent {
     Disconnected { name: String },
     /// Refused, and why in a word (DYNAUTH-8).
     Refused { reason: Refusal, message: String },
+    /// DYNAUTH-5: what `peer` may now do: the needs it may call back up,
+    /// and the roles that may call into it.
+    Consented { peer: String, needs: Vec<String>, callers: Vec<String> },
     /// Why not.
     Error { message: String },
 }
@@ -262,6 +291,31 @@ struct Inner {
     started: std::sync::atomic::AtomicBool,
     /// NEST-15: the names this `dyn` serves at the service's top level.
     top: Mutex<std::collections::BTreeSet<String>>,
+    /// DYNAUTH-5: consent (and DYNAUTH-7's revocations), kept in
+    /// `<data_dir>/consent.json`.
+    store: Mutex<consent::Store>,
+}
+
+impl consent::ConsentSource for Inner {
+    fn consented_grants(&self, role: &str) -> Vec<String> {
+        let store = self.store.lock().unwrap();
+        let peers = self.peers.lock().unwrap();
+        let top = self.top.lock().unwrap();
+        let mut out = Vec::new();
+        for (name, c) in &store.consents {
+            if store.revoked.contains_key(name) || !c.callers.iter().any(|r| r == role) {
+                continue;
+            }
+            let Some(child) = peers.get(name).and_then(|e| e.child.as_ref()) else { continue };
+            for m in consent::method_paths(child) {
+                out.push(format!("dyn.peer.{name}.{m}"));
+                if top.contains(name) {
+                    out.push(format!("{name}.{m}"));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// The `dyn` activation. Cheap to clone.
@@ -295,8 +349,125 @@ impl DynActivation {
                 host: Mutex::default(),
                 started: Default::default(),
                 top: Mutex::default(),
+                store: Mutex::new(consent::Store::default()),
             }),
         }
+        .loaded()
+    }
+
+    /// DYNAUTH-5: the consent kept in the data directory, read at start.
+    fn loaded(self) -> Self {
+        match consent::Store::load(&self.store_path()) {
+            Ok(s) => *self.inner.store.lock().unwrap() = s,
+            Err(why) => tracing::error!(target: "plexus::dyn", "consent not read, none kept: {why}"),
+        }
+        self
+    }
+
+    fn store_path(&self) -> PathBuf {
+        self.inner.opts.data_dir.join("consent.json")
+    }
+
+    fn save_store(&self) -> Result<(), String> {
+        let s = self.inner.store.lock().unwrap().clone();
+        s.save(&self.store_path())
+    }
+
+    /// DYNAUTH-5: the service's `roles`, plus the grants consent gives
+    /// (`dyn.consent … callers`): hand the result to the gate in their
+    /// place.
+    pub fn consent_roles(&self, roles: Arc<dyn plexus_auth_core::grants::Roles>) -> Arc<dyn plexus_auth_core::grants::Roles> {
+        let weak = Arc::downgrade(&self.inner);
+        Arc::new(ConsentRoles { base: roles, source: weak })
+    }
+
+    /// DYNAUTH-5: a peer's declared needs, by method.
+    fn declared(child: &RemoteChild) -> Option<Vec<String>> {
+        child.needs().map(|n| n.iter().map(|n| n.method.clone()).collect())
+    }
+
+    /// DYNAUTH-5: hold `child`'s calls back to what is consented for
+    /// `name` (everything declared when consent is not required).
+    fn hold(&self, name: &str, child: &RemoteChild) {
+        if !self.inner.opts.require_consent {
+            child.set_consent(None);
+            return;
+        }
+        let declared = Self::declared(child);
+        let store = self.inner.store.lock().unwrap();
+        child.set_consent(Some(consent::consented(store.consents.get(name), declared.as_deref())));
+    }
+
+    /// DYNAUTH-5: a new registration of `name` under `key` — the consent
+    /// kept for another key is dropped (another client).
+    fn register(&self, name: &str, key: Option<&str>) {
+        let dropped = {
+            let mut store = self.inner.store.lock().unwrap();
+            match store.consents.get(name) {
+                Some(c) if c.key.as_deref() != key => store.consents.remove(name).is_some(),
+                _ => false,
+            }
+        };
+        if dropped {
+            tracing::warn!(target: "plexus::dyn", peer = %name, "registered under another key: its consent is dropped");
+            if let Err(why) = self.save_store() {
+                tracing::error!(target: "plexus::dyn", "{why}");
+            }
+            self.moved();
+        }
+    }
+
+    /// The gate's grants generation moves (consent changed what a role holds).
+    fn moved(&self) {
+        let service = self.inner.host.lock().unwrap().as_ref().and_then(WeakService::upgrade);
+        if let Some(gate) = service.as_ref().and_then(|s| s.gate()) {
+            gate.moved(plexus_auth_core::grants::GrantsMove::RoleEdit);
+        }
+    }
+
+    /// DYNAUTH-5: what is registered and consented, per peer.
+    pub fn consent_list(&self) -> Vec<ConsentInfo> {
+        let store = self.inner.store.lock().unwrap().clone();
+        let peers = self.inner.peers.lock().unwrap();
+        let mut names: std::collections::BTreeSet<String> = peers.keys().cloned().collect();
+        names.extend(store.consents.keys().cloned());
+        names
+            .into_iter()
+            .map(|name| {
+                let child = peers.get(&name).and_then(|e| e.child.as_ref());
+                let declared = child.and_then(Self::declared);
+                let c = store.consents.get(&name).cloned().unwrap_or_default();
+                let held: Vec<String> = c.needs.iter().map(|n| consent::split_need(n).0.to_string()).collect();
+                let pending = declared.iter().flatten().filter(|d| !held.contains(d)).cloned().collect();
+                ConsentInfo {
+                    key: child.and_then(|c| c.peer_key().map(str::to_string)).or(c.key.clone()),
+                    declared,
+                    needs: c.needs,
+                    pending,
+                    callers: c.callers,
+                    revoked: store.revoked.get(&name).cloned(),
+                    peer: name,
+                }
+            })
+            .collect()
+    }
+
+    /// DYNAUTH-5: set what `peer` may do (replacing what it could).
+    pub fn set_consent(&self, peer: &str, needs: Vec<String>, callers: Vec<String>) -> Result<Consent, String> {
+        let child = self.inner.peers.lock().unwrap().get(peer).map(|e| e.child.clone());
+        let child = match child {
+            None => return Err(format!("no peer `{peer}`: connect or grow it first, so its needs are known")),
+            Some(None) => return Err(format!("`{peer}` is not mounted now: its needs are not known")),
+            Some(Some(c)) => c,
+        };
+        let c = Consent { needs, callers, key: child.peer_key().map(str::to_string) };
+        consent::check(peer, &c, Self::declared(&child).as_deref())?;
+        self.inner.store.lock().unwrap().consents.insert(peer.to_string(), c.clone());
+        self.save_store()?;
+        self.hold(peer, &child);
+        self.moved();
+        tracing::info!(target: "plexus::audit", peer = %peer, needs = ?c.needs, callers = ?c.callers, "dyn consent");
+        Ok(c)
     }
 
     /// The options it runs with.
@@ -512,6 +683,7 @@ impl DynActivation {
                 e.child = Some(child.clone());
                 e.why = None;
                 drop(peers);
+                self.hold(name, &child);
                 if let Err(why) = self.surface(name, &child) {
                     tracing::warn!(target: "plexus::dyn", peer = %name, "{why}");
                 }
@@ -577,6 +749,10 @@ impl DynActivation {
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
                 let pin = child.identity().map(PeerIdentity::from);
+                // DYNAUTH-5: registered — its key and needs — and held to
+                // what is consented for it.
+                self.register(&name, child.peer_key());
+                self.hold(&name, &child);
                 self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin });
                 if let Err(message) = self.surface(&name, &child) {
                     self.inner.peers.lock().unwrap().remove(&name);
@@ -749,7 +925,7 @@ pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
 
 /// Runtime peers: connect services, grow dendrites, call them as
 /// `dyn.peer.<name>.<path>.<method>`.
-#[plexus_macros::activation(roles(viewer = ["peers", "names"]))]
+#[plexus_macros::activation(roles(viewer = ["peers", "names", "consents"]))]
 impl DynActivation {
     /// Connect the service at `url` (a WebSocket) as the peer `name`; a taken
     /// name is refused unless `replace`. `wss://` anywhere, `ws://` only to
@@ -800,6 +976,25 @@ impl DynActivation {
             None => DynEvent::Error { message: format!("no peer `{name}`") },
         }
 
+    }
+
+    /// DYNAUTH-5: consent to what `peer` asks for. `needs`: the subset of
+    /// its declared needs it may call back up through this service, each
+    /// `method` or `method@scope`; `callers`: the roles whose holders may
+    /// call into it. Replaces what it held; empty lists withdraw it.
+    #[plexus_macros::method]
+    pub async fn consent(&self, peer: String, needs: Option<Vec<String>>, callers: Option<Vec<String>>) -> DynEvent {
+        match self.set_consent(&peer, needs.unwrap_or_default(), callers.unwrap_or_default()) {
+            Ok(c) => DynEvent::Consented { peer, needs: c.needs, callers: c.callers },
+            Err(message) => DynEvent::Error { message },
+        }
+    }
+
+    /// DYNAUTH-5: each peer's registration — its key, what it declares it
+    /// needs — and what is consented, what is still pending.
+    #[plexus_macros::method]
+    pub async fn consents(&self) -> impl Stream<Item = ConsentInfo> + Send + 'static {
+        futures::stream::iter(self.consent_list())
     }
 
     /// Every peer: its kind, whether it is up, its interface's hash, its
