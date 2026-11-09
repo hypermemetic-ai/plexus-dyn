@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+DYNAUTH-6: **token exchange.** A peer calling onward through the host gets
+the next peer a token by exchange (plexus-core): the caller stays `sub`,
+the presenter joins `act`, the scope never widens. `dyn.exchange {
+subject_token, proof, audience, scope?, method? }` (public; the authority is
+the token and its proof) does it as a method, RFC 8693's response as
+`ExchangeEvent::Exchanged`; refused without a proof, for a pipe's token,
+or for a peer that proved no key.
+
 DYNAUTH-12: **peer tokens.** `dyn` signs a token for every call forwarded
 to a peer that proved a key (bound to it) and to a dendrite on its pipe
 (plexus-core's `ChildOptions::tokens`): `sub` the caller, `act` the host,

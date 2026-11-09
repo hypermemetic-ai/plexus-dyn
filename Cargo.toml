@@ -41,6 +41,8 @@ tracing = "0.1"
 landlock = "0.4.7"
 
 [dev-dependencies]
+# DYNAUTH-6: a test peer reads its own token's claims.
+base64 = "0.22"
 plexus-transport = { version = "0.9", default-features = false, features = ["tls"] }
 # DYNAUTH-8: a test CA for the wss:// peer (tests/dyn.rs).
 rcgen = "0.14"

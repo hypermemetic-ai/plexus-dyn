@@ -13,6 +13,7 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.names` | viewer | each peer's name — the slot's list |
 | `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
 | `dyn.jwks` | public | DYNAUTH-12: the JWK Set (Ed25519, `kid` = `key:<hex>`) a peer verifies this service's tokens with |
+| `dyn.exchange { subject_token, proof, audience, scope?, method? }` | public | DYNAUTH-6: RFC 8693 token exchange — a peer's token, with its proof of possession (method `exchange`, the token's `call`), for one addressed to the connected keyed peer `audience`, its scope never wider |
 | `dyn.consents` | viewer | each peer's key (proved at `_info`), declared needs, consented needs and callers, what is pending |
 | `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead, or be named by its consent's `callers` |
 
@@ -152,6 +153,16 @@ key-bound token, a peer sends a proof of possession by its key for that
 method and call (plexus-core's `host()` does it); without one it is
 refused. The signing key is `<data-dir>/dyn.key` (0600), denied to every
 dendrite. A WebSocket peer that proves no key gets no token.
+
+## Onward calls (DYNAUTH-6)
+
+A peer's call back is held to its needs, to consent, and to the token its
+call was made under; the NEST-11 `admin@<scope>` layer stays only as the
+outer bound ("any grant, only there"). When that call back reaches another
+peer, the token minted for it is an exchange of the presented one: the
+original caller stays `sub`, `act` names each hop nearest first (`{sub:
+host, act: {sub: <presenter>, act: {sub: host}}}`), and its scope is never
+wider. `dyn.exchange` does the same as a method.
 
 ## In a service
 

@@ -584,11 +584,109 @@ impl RelayActivation {
     pub async fn rain(&self, city: String) -> Value {
         up("dyn.peer.v", "forecast", json!({ "city": city })).await
     }
+    /// What the host's peer `t` says its token for this call holds.
+    #[plexus_macros::method(uses("dyn.peer.t.claims"))]
+    pub async fn ask(&self) -> Value {
+        up_first("dyn.peer.t", "claims", json!({})).await
+    }
     /// Past its needs.
     #[plexus_macros::method]
     pub async fn sneak(&self) -> Value {
         up("dyn", "grow", json!({ "name": "x", "source": "", "targets": [] })).await
     }
+}
+
+/// The first item of a call back, or the refusal.
+async fn up_first(path: &str, name: &str, params: Value) -> Value {
+    use plexus_client::{MethodRef, StreamItem, Transport};
+    let t = match plexus_core::plexus::remote_child::host() {
+        Ok(t) => t,
+        Err(e) => return json!({ "no_host": e.to_string() }),
+    };
+    let items: Vec<_> = t.call(MethodRef::named(path.to_string(), name.to_string()), params).collect().await;
+    match items.into_iter().next() {
+        Some(Ok(StreamItem::Data { content, .. })) => content,
+        Some(Ok(StreamItem::Error { message, .. })) => json!({ "refused": message }),
+        other => json!({ "other": format!("{other:?}") }),
+    }
+}
+
+#[derive(Clone)]
+pub struct TellActivation;
+
+/// A peer that says what its token says.
+#[plexus_macros::activation]
+impl TellActivation {
+    /// This call's token (test only: a peer never echoes it) and its claims.
+    #[plexus_macros::method]
+    pub async fn claims(&self) -> Value {
+        use base64::Engine as _;
+        let Ok(hop) = plexus_core::call::hop() else { return json!({ "no_hop": true }) };
+        let token = hop.token.clone().unwrap_or_default();
+        let claims: Value = token
+            .split('.')
+            .nth(1)
+            .and_then(|p| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null);
+        json!({ "token": token, "claims": claims })
+    }
+}
+
+/// DYNAUTH-6: a peer calling onward through its service gets the next peer
+/// a token by exchange (RFC 8693) — the same subject, the presenter in the
+/// actor chain, a scope never wider; `dyn.exchange` does the same as a
+/// method, with a proof, and refuses without one.
+async fn an_onward_call_is_an_exchange() {
+    use plexus_core::plexus::peer_token::{prove, Expect, PeerKey, Verifier, EXCHANGE};
+    let r = rig().await;
+    let (tk, rk) = (PeerKey::generate(), PeerKey::generate());
+    let (tp, rp) = (free_port(), free_port());
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims"] })).await;
+    let host = r.dyn_.issuer().kid();
+    // Direct: t's token is a mint, the host the only actor.
+    let direct = call(&r, USER, "dyn.peer.t.claims", json!({})).await.remove(0);
+    assert_eq!(direct["claims"]["act"], json!({ "sub": host }), "{direct:?}");
+    // Onward, through relay: an exchange.
+    let got = call(&r, USER, "dyn.peer.relay.ask", json!({})).await.remove(0);
+    let c = &got["claims"];
+    assert_eq!(c["sub"], USER, "the subject survives the hop: {got:?}");
+    assert_eq!(c["aud"], tk.kid());
+    assert_eq!(c["act"], json!({ "sub": host, "act": { "sub": rk.kid(), "act": { "sub": host } } }), "act names each hop, nearest first: {got:?}");
+    assert_eq!(c["scope"], "tell.claims@*", "only what reaching t needs, held by relay's token: {got:?}");
+    // The method: t's token, presented by t with its proof, exchanged for
+    // one addressed to relay — narrowed to what is asked, never wider.
+    let subject = direct["token"].as_str().unwrap().to_string();
+    let subject_call = direct["claims"]["call"].as_str().unwrap().to_string();
+    let no_proof: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": "", "audience": "relay" }), None).await).await;
+    assert_eq!(no_proof[0]["type"], "error", "{no_proof:?}");
+    let proof = prove(&tk, &subject, EXCHANGE, &subject_call);
+    let asked = json!({ "subject_token": subject, "proof": proof, "audience": "relay", "scope": ["tell.claims@*", "auth.grant@*"] });
+    let ex: Vec<Value> = items(r.host.route("dyn.exchange", asked.clone(), None).await).await;
+    assert_eq!(ex[0]["type"], "exchanged", "{ex:?}");
+    assert_eq!(ex[0]["scope"], json!(["tell.claims@*"]), "never wider than the subject's: {ex:?}");
+    assert_eq!(ex[0]["issued_token_type"], "urn:ietf:params:oauth:token-type:jwt");
+    let at_relay = Verifier::new(rk.kid(), &r.dyn_.jwk_set()).unwrap();
+    let claims = at_relay.verify(ex[0]["access_token"].as_str().unwrap(), &Expect::default()).unwrap();
+    assert_eq!(claims.sub, USER);
+    assert_eq!(claims.actors(), [host.clone(), tk.kid().to_string(), host.clone()]);
+    // The same proof again: refused (a proof is used once).
+    let again: Vec<Value> = items(r.host.route("dyn.exchange", asked, None).await).await;
+    assert_eq!(again[0]["type"], "error", "{again:?}");
+    // For a peer that proved no key: refused.
+    let port = free_port();
+    let far = far(port, false).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://127.0.0.1:{port}") })).await;
+    let proof = prove(&tk, &subject, EXCHANGE, &subject_call);
+    let keyless: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": proof, "audience": "w" }), None).await).await;
+    assert!(keyless[0]["message"].as_str().is_some_and(|m| m.contains("proved a key")), "{keyless:?}");
+    stop(far).await;
+    t.abort();
+    relay.abort();
 }
 
 /// Call the host back from inside a call; the items, or the refusal.
@@ -626,8 +724,8 @@ async fn a_keyed_peer_calls_back_with_its_proof() {
     assert_eq!(got[0]["type"], "connected", "{got:?}");
     let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
     let mine = listed.iter().find(|c| c["peer"] == "relay").unwrap();
-    assert_eq!(mine["declared"], json!(["dyn.peer.v.forecast"]), "{listed:?}");
-    assert_eq!(mine["pending"], json!(["dyn.peer.v.forecast"]), "{listed:?}");
+    assert_eq!(mine["declared"], json!(["dyn.peer.t.claims", "dyn.peer.v.forecast"]), "{listed:?}");
+    assert_eq!(mine["pending"], mine["declared"], "{listed:?}");
     let before = call(&r, USER, "dyn.peer.relay.rain", json!({ "city": "oslo" })).await;
     assert!(before[0]["refused"].as_str().is_some_and(|m| m.contains("consented")), "{before:?}");
     call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.v.forecast"] })).await;
@@ -1134,7 +1232,8 @@ fn main() {
             a_viewer_with_consent_reaches_a_peer,
             a_peer_whose_key_changed_is_refused_at_remount,
             a_verifying_peer_takes_a_call_by_its_token,
-            a_keyed_peer_calls_back_with_its_proof
+            a_keyed_peer_calls_back_with_its_proof,
+            an_onward_call_is_an_exchange
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });
