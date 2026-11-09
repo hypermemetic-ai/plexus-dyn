@@ -31,7 +31,7 @@ use futures::{SinkExt, Stream, StreamExt};
 use plexus_auth_core::grants::{Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef};
 use plexus_core::plexus::{AuthContext, PlexusStream, PlexusStreamItem};
 use plexus_core::DynamicHub;
-use plexus_dyn::{DynActivation, DynOptions, PeerInfo};
+use plexus_dyn::{Containment, DynActivation, DynOptions, PeerInfo};
 use serde_json::{json, Value};
 
 const ADMIN: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -573,11 +573,16 @@ const SECRET_ENV: &str = "PLEXUS_DYN_TEST_SECRET";
 const PASSED_ENV: &str = "PLEXUS_DYN_TEST_PASSED";
 
 const PROBE: &str = r#"// A dendrite that looks around: what it may read and write, and what it sees.
-import { readFileSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 
 /** Try to read `path`: whether it could, and the error's code if not. */
 export async function read({ path }: { path: string }) {
   try { readFileSync(path); return { ok: true, code: "" }; } catch (e) { return { ok: false, code: String((e as { code?: string }).code ?? e) }; }
+}
+
+/** Try to list the directory `path`. */
+export async function list({ path }: { path: string }) {
+  try { readdirSync(path); return { ok: true, code: "" }; } catch (e) { return { ok: false, code: String((e as { code?: string }).code ?? e) }; }
 }
 
 /** Try to write `path`. */
@@ -643,6 +648,17 @@ async fn a_grown_dendrite_is_contained() {
             assert_eq!(got["code"], "EACCES", "~/.plexus/keys: {got:?}");
         }
     }
+    // DYNAUTH-22: every secret store of this machine's user that is there —
+    // a file read, a directory listed — refused.
+    let stores = Containment::default_deny(&data);
+    let mut seen = 0;
+    for store in stores.iter().skip(1) {
+        let (method, what) = if store.is_dir() { ("dyn.peer.probe.list", "listed") } else { ("dyn.peer.probe.read", "read") };
+        let got = call(&r, ADMIN, method, json!({ "path": store.display().to_string() })).await.remove(0);
+        assert_eq!((got["ok"].as_bool(), got["code"].as_str()), (Some(false), Some("EACCES")), "{} {what}: {got:?}", store.display());
+        seen += 1;
+    }
+    println!("measure: {seen} secret stores present here, each refused");
     let w = call(&r, ADMIN, "dyn.peer.probe.write", json!({ "path": data.join("other/planted.txt").display().to_string() })).await.remove(0);
     assert_eq!(w["code"], "EACCES", "{w:?}");
     assert!(!data.join("other/planted.txt").exists());

@@ -32,8 +32,12 @@
 //! **Containment** (DYNAUTH-9, TM-5): a dendrite is spawned through
 //! `plexus-dyn-contain` ([`contain`]): a cleared environment (its own
 //! `HOME` and `TMPDIR`), its own directory, and on Linux a Landlock ruleset
-//! that denies it `dyn`'s data directory, `~/.plexus`, `~/.ssh`, `~/.gnupg`,
-//! `~/.password-store`, the dial key and [`Containment::deny`]. Where
+//! that denies it `dyn`'s data directory, every secret store of the user's
+//! that is there ([`contain::SECRET_STORES`], [`contain::RUNTIME_SECRETS`]:
+//! `~/.plexus`, `~/.ssh`, `~/.gnupg`, `~/.password-store`, hyperforge's,
+//! gh's, menger's, cargo's credentials, docker's, kube's, the cloud CLIs',
+//! `~/.netrc`, `~/.npmrc`, `~/.pypirc`, synapse's holder socket), the dial
+//! key and [`Containment::deny`]. Where
 //! Landlock is not there it runs with the cleared environment and a
 //! warning, unless [`Containment::require`]. `dyn.grow` stays the admin's:
 //! until microVMs a dendrite is host-equivalent trust.

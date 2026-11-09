@@ -13,6 +13,15 @@ identity (`_info` backend, the TLS key) is pinned at connect, shown in
 Needs the plexus-core after 0.10.1 (`RemoteChild::identity`,
 `ChildOptions::tls_roots`).
 
+DYNAUTH-22: **every secret store denied by default.** A contained
+dendrite's default deny list grows from six paths to every secret store on
+the machine that is there: hyperforge's (plaintext `secrets.yaml`), gh's,
+menger's, cargo's credentials, docker's `config.json`, `~/.kube`, `~/.aws`,
+`~/.config/gcloud`, `~/.netrc`, `~/.npmrc`, `~/.pypirc` and
+`$XDG_RUNTIME_DIR/synapse` (the signed-in holder). A path not there is
+skipped. New: `contain::{SECRET_STORES, RUNTIME_SECRETS}`,
+`Containment::default_deny_in`.
+
 DYNAUTH-9 (TM-5): **a grown dendrite, contained.** Spawned through the new
 binary `plexus-dyn-contain`: a cleared environment (own `HOME`, `TMPDIR`),
 its own directory as cwd, and on Linux a Landlock ruleset (landlock 0.4.7,
