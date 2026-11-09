@@ -40,16 +40,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, Stream, StreamExt};
-use plexus_auth_core::grants::{Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef};
-use plexus_core::plexus::{AuthContext, PlexusStream, PlexusStreamItem};
+use plexus_core::plexus::{PlexusStream, PlexusError};
 use plexus_core::DynamicHub;
 use plexus_core::plexus::HubTransport;
 use plexus_dyn::{Containment, DynActivation, DynClient, DynOptions, PeerInfo};
+use plexus_testkit::parts::{items, who};
+use plexus_testkit::{Host, World, ADMIN, USER, VIEWER};
 use serde_json::{json, Value};
 
-const ADMIN: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const USER: &str = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const VIEWER: &str = "key:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const DIGEST_ONLY: &str = "key:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 const TOP: &str = "key:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
@@ -131,30 +129,12 @@ async fn stop(h: jsonrpsee::server::ServerHandle) {
 
 // ------------------------------------------------------------------ the host
 
-#[derive(Default)]
-struct Members(Mutex<Vec<Membership>>);
-impl Memberships for Members {
-    fn held(&self, who: &plexus_auth_core::identity::Principal) -> Vec<Membership> {
-        self.0.lock().unwrap().iter().filter(|m| &m.principal == who).cloned().collect()
-    }
-}
-struct Everywhere;
-impl Resolve for Everywhere {
-    fn chain(&self, _t: &str) -> Option<Vec<ScopeRef>> {
-        Some(vec![ScopeRef::Everywhere])
-    }
-}
-
-fn who(p: &str) -> AuthContext {
-    AuthContext::for_principal(&p.parse().unwrap(), "s1", vec![], Value::Null)
-}
-
 fn dendrite_bin() -> PathBuf {
     std::env::var_os("PLEXUS_DENDRITE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plexus-dendrite/bin/plexus-dendrite"))
 }
 
 struct Rig {
-    host: Arc<DynamicHub>,
+    host: Host,
     dyn_: DynActivation,
     _data: tempfile::TempDir,
 }
@@ -180,22 +160,19 @@ async fn rig_opts(peers_file: Option<PathBuf>, tweak: impl FnOnce(&mut DynOption
     opts.contain.launcher = Some(PathBuf::from(env!("CARGO_BIN_EXE_plexus-dyn-contain")));
     tweak(&mut opts);
     let dyn_ = DynActivation::new(opts);
-    let plain = DynamicHub::new("host").register(dyn_.clone());
-    let declared = plain.declared_roles();
-    let mut lists: Vec<(String, Vec<String>)> = declared.into_iter().collect();
-    lists.push(("user".into(), vec!["dyn.{peer}".into(), "dyn.peers".into()]));
-    lists.push(("digest_only".into(), vec!["dyn.peer.digest.rainy".into()]));
-    lists.push(("top".into(), vec!["w.weather.forecast".into()]));
-    let roles = RoleTable::from_lists(lists.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
-    let members = Arc::new(Members::default());
-    for (p, r) in [(ADMIN, "admin"), (USER, "user"), (VIEWER, "viewer"), (DIGEST_ONLY, "digest_only"), (TOP, "top")] {
-        members.0.lock().unwrap().push(Membership { principal: p.parse().unwrap(), role: plexus_auth_core::RoleName::new(r), scope: ScopeRef::Everywhere });
-    }
-    // DYNAUTH-5: the roles, plus what consent gives a role.
-    let gate = Arc::new(Gate::new(members, dyn_.consent_roles(Arc::new(roles)), Arc::new(Everywhere)));
-    // NEST-21: the service's configuration served, as `config` (admin's).
-    let host = Arc::new(DynamicHub::new("host").register(dyn_.clone()).with_config_service().with_gate(gate));
-    dyn_.start(&host).await.unwrap();
+    let consent = dyn_.clone();
+    let host = World::new().host().with(dyn_.clone())
+        // NEST-21: the service's configuration served, as `config` (admin's).
+        .configure(|s| s.with_config_service())
+        .role("user", ["dyn.{peer}", "dyn.peers"])
+        .role("digest_only", ["dyn.peer.digest.rainy"])
+        .role("top", ["w.weather.forecast"])
+        .member(DIGEST_ONLY, "digest_only")
+        .member(TOP, "top")
+        // DYNAUTH-5: the roles, plus what consent gives a role.
+        .roles_through(move |roles| consent.consent_roles(roles))
+        .await;
+    dyn_.start(host.service()).await.unwrap();
     Rig { host, dyn_, _data: data }
 }
 
@@ -203,22 +180,17 @@ async fn rig() -> Rig {
     rig_with(None).await
 }
 
-async fn items(r: Result<PlexusStream, plexus_core::plexus::PlexusError>) -> Vec<Value> {
+/// The kit's items, a routing refusal read by its `Display` (the kit's
+/// shape is its `Debug`), as this file always has.
+async fn shown(r: Result<PlexusStream, PlexusError>) -> Vec<Value> {
     match r {
         Err(e) => vec![json!({ "route_error": format!("{e}") })],
-        Ok(stream) => stream
-            .map(|i| match i {
-                PlexusStreamItem::Data { content, .. } => content.into_value(),
-                other => serde_json::to_value(other).unwrap(),
-            })
-            .filter(|v| futures::future::ready(v["type"] != "done"))
-            .collect()
-            .await,
+        routed => items(routed).await,
     }
 }
 
 async fn call(r: &Rig, caller: &str, method: &str, params: Value) -> Vec<Value> {
-    items(r.host.route(method, params, Some(&who(caller))).await).await
+    shown(r.host.as_(caller).route(method, params).await).await
 }
 
 fn peer<'a>(r: &Rig, name: &str) -> PeerInfo {
@@ -540,7 +512,7 @@ fn verifying(key: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core:
 async fn a_verifying_peer_takes_a_call_by_its_token() {
     use plexus_core::plexus::peer_token::{Jwks, PeerKey};
     let r = rig().await;
-    let jwks: Vec<Value> = items(r.host.route("dyn.jwks", json!({}), None).await).await;
+    let jwks: Vec<Value> = shown(r.host.anonymous().route("dyn.jwks", json!({})).await).await;
     assert_eq!(jwks[0]["keys"][0]["kty"], "OKP", "anonymous: {jwks:?}");
     assert_eq!(jwks[0]["keys"][0]["kid"], r.dyn_.issuer().kid(), "{jwks:?}");
     let key = PeerKey::generate();
@@ -667,11 +639,11 @@ async fn an_onward_call_is_an_exchange() {
     // one addressed to relay — narrowed to what is asked, never wider.
     let subject = direct["token"].as_str().unwrap().to_string();
     let subject_call = direct["claims"]["call"].as_str().unwrap().to_string();
-    let no_proof: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": "", "audience": "relay" }), None).await).await;
+    let no_proof: Vec<Value> = shown(r.host.anonymous().route("dyn.exchange", json!({ "subject_token": subject, "proof": "", "audience": "relay" })).await).await;
     assert_eq!(no_proof[0]["type"], "error", "{no_proof:?}");
     let proof = prove(&tk, &subject, EXCHANGE, &subject_call);
     let asked = json!({ "subject_token": subject, "proof": proof, "audience": "relay", "scope": ["tell.claims@*", "auth.grant@*"] });
-    let ex: Vec<Value> = items(r.host.route("dyn.exchange", asked.clone(), None).await).await;
+    let ex: Vec<Value> = shown(r.host.anonymous().route("dyn.exchange", asked.clone()).await).await;
     assert_eq!(ex[0]["type"], "exchanged", "{ex:?}");
     assert_eq!(ex[0]["scope"], json!(["tell.claims@*"]), "never wider than the subject's: {ex:?}");
     assert_eq!(ex[0]["issued_token_type"], "urn:ietf:params:oauth:token-type:jwt");
@@ -680,14 +652,14 @@ async fn an_onward_call_is_an_exchange() {
     assert_eq!(claims.sub, USER);
     assert_eq!(claims.actors(), [host.clone(), tk.kid().to_string(), host.clone()]);
     // The same proof again: refused (a proof is used once).
-    let again: Vec<Value> = items(r.host.route("dyn.exchange", asked, None).await).await;
+    let again: Vec<Value> = shown(r.host.anonymous().route("dyn.exchange", asked).await).await;
     assert_eq!(again[0]["type"], "error", "{again:?}");
     // For a peer that proved no key: refused.
     let port = free_port();
     let far = far(port, false).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://127.0.0.1:{port}") })).await;
     let proof = prove(&tk, &subject, EXCHANGE, &subject_call);
-    let keyless: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": proof, "audience": "w" }), None).await).await;
+    let keyless: Vec<Value> = shown(r.host.anonymous().route("dyn.exchange", json!({ "subject_token": subject, "proof": proof, "audience": "w" })).await).await;
     assert!(keyless[0]["message"].as_str().is_some_and(|m| m.contains("proved a key")), "{keyless:?}");
     stop(far).await;
     t.abort();
@@ -962,7 +934,7 @@ async fn a_peer_grows_the_top_level() {
     let port = free_port();
     let far = far(port, false).await;
     let r = rig_opts(None, |o| o.top_level = true).await;
-    let top = |r: &Rig| -> Vec<String> { r.host.root().names() };
+    let top = |r: &Rig| -> Vec<String> { r.host.service().root().names() };
     assert_eq!(top(&r), ["config", "dyn"], "NEST-21: the rig serves `config` too");
     let url = format!("ws://127.0.0.1:{port}");
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
@@ -1006,7 +978,7 @@ async fn dyn_client_reaches_a_peer_untyped_and_typed() {
     let r = rig().await;
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://127.0.0.1:{port}") })).await;
     assert_eq!(got[0]["type"], "connected", "{got:?}");
-    let client = DynClient::new(HubTransport::as_(r.host.clone(), who(USER)));
+    let client = DynClient::new(HubTransport::as_(r.host.service().clone(), who(USER)));
     // Untyped: by name.
     let peer = client.peer("w");
     assert_eq!(peer.path(), "dyn.peer.w");
@@ -1305,7 +1277,7 @@ async fn dyn_settings_are_on_the_service_configuration() {
         o.child.max_calls = 7;
     })
     .await;
-    let c = r.host.config();
+    let c = r.host.service().config();
     assert!(r.dyn_.config().same(&c), "dyn reads the service's");
     let listed = call(&r, ADMIN, "config.list", json!({})).await;
     let by = |k: &str| listed.iter().find(|i| i["key"] == k).cloned().unwrap_or_else(|| panic!("{k} not listed: {listed:?}"));

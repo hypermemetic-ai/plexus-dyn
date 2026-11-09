@@ -43,6 +43,10 @@ tracing = "0.1"
 landlock = "0.4.7"
 
 [dev-dependencies]
+# KEEL-9: the test kit — a world, a host with its gate and roles, callers by
+# name. Unpublished (plexus-core's `testkit/`): reached through the
+# git-ignored [patch.crates-io] in .cargo/config.toml, as the siblings are.
+plexus-testkit = "0.1.0"
 # DYNAUTH-6: a test peer reads its own token's claims.
 base64 = "0.22"
 plexus-transport = { version = "0.10", default-features = false, features = ["tls"] }
