@@ -1,6 +1,19 @@
 # Changelog
 
-## [Unreleased] — 0.1.0
+## [Unreleased]
+
+DYNAUTH-8 (TM-3): **transport hardening.** `ws://` only to loopback;
+`wss://` beyond it, certificates validated (plexus-core's `child-wss`, with
+`ChildOptions::tls_roots` for more CAs); `DynOptions::insecure_ws` allows a
+test network's plain `ws://`, said as `insecure` in `dyn.peers`. A peer's
+identity (`_info` backend, the TLS key) is pinned at connect, shown in
+`dyn.peers`, and a redial or remount that proves another is refused until a
+`connect … replace`. New: `DynEvent::Refused { reason, message }`,
+`Refusal`, `PeerIdentity`, `check_url`, `PeerInfo::{identity, insecure}`.
+Needs the plexus-core after 0.10.1 (`RemoteChild::identity`,
+`ChildOptions::tls_roots`).
+
+## 0.1.0
 
 NEST-12: the first release. `dyn`, an activation that connects to other
 services at runtime (`connect`), grows TypeScript dendrites (`grow`, served

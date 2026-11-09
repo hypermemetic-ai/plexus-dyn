@@ -20,7 +20,16 @@
 //!   service does not serve is refused at `grow`, naming them;
 //! - NEST-14: `DynClient` reaches a peer through the slot — untyped, by
 //!   method name, and typed, as the far activation's own client once the
-//!   peer's schema says it serves it (`ShapeMismatch` else).
+//!   peer's schema says it serves it (`ShapeMismatch` else);
+//! - DYNAUTH-8: `ws://` beyond loopback refused (`insecure_transport`), or
+//!   allowed and said (`insecure`); a `wss://` peer's certificate validated
+//!   and its key pinned — a restart with another key refused
+//!   (`identity_changed`) until it is connected again with `replace`.
+//! - DYNAUTH-9: a grown dendrite is contained — it cannot read a key file,
+//!   another dendrite's directory or `~/.plexus`, nor see the host's
+//!   environment; it reads and writes its own directory. Without its
+//!   launcher it is refused when containment is required, else run with a
+//!   cleared environment.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -31,7 +40,7 @@ use plexus_auth_core::grants::{Gate, Membership, Memberships, Resolve, RoleTable
 use plexus_core::plexus::{AuthContext, PlexusStream, PlexusStreamItem};
 use plexus_core::DynamicHub;
 use plexus_core::plexus::HubTransport;
-use plexus_dyn::{DynActivation, DynClient, DynOptions, PeerInfo};
+use plexus_dyn::{Containment, DynActivation, DynClient, DynOptions, PeerInfo};
 use serde_json::{json, Value};
 
 const ADMIN: &str = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -151,19 +160,21 @@ struct Rig {
 /// `dyn.peer.digest.rainy` and nothing else; TOP: `w.weather.forecast` (a
 /// peer at the top level, NEST-15) and nothing else.
 async fn rig_with(peers_file: Option<PathBuf>) -> Rig {
-    rig_opts(peers_file, false).await
+    rig_opts(peers_file, |_| {}).await
 }
 
-async fn rig_opts(peers_file: Option<PathBuf>, top_level: bool) -> Rig {
+async fn rig_opts(peers_file: Option<PathBuf>, tweak: impl FnOnce(&mut DynOptions)) -> Rig {
     let data = tempfile::tempdir().unwrap();
-    let opts = DynOptions {
+    let mut opts = DynOptions {
         data_dir: data.path().to_path_buf(),
         dendrite: dendrite_bin(),
         liveness: Duration::from_millis(300),
         peers_file,
-        top_level,
         ..DynOptions::default()
     };
+    // DYNAUTH-9: every dendrite here runs contained, by this build's launcher.
+    opts.contain.launcher = Some(PathBuf::from(env!("CARGO_BIN_EXE_plexus-dyn-contain")));
+    tweak(&mut opts);
     let dyn_ = DynActivation::new(opts);
     let plain = DynamicHub::new("host").register(dyn_.clone());
     let declared = plain.declared_roles();
@@ -434,7 +445,7 @@ async fn the_peers_file_is_connected_at_start() {
 async fn a_peer_grows_the_top_level() {
     let port = free_port();
     let far = far(port, false).await;
-    let r = rig_opts(None, true).await;
+    let r = rig_opts(None, |o| o.top_level = true).await;
     let top = |r: &Rig| -> Vec<String> { r.host.root().names() };
     assert_eq!(top(&r), ["dyn"]);
     let url = format!("ws://127.0.0.1:{port}");
@@ -557,7 +568,265 @@ async fn a_dendrite_whose_needs_are_not_served_is_refused() {
     assert!(r.dyn_.list().is_empty());
 }
 
+// ------------------------------------------------------------------ DYNAUTH-8
+
+async fn ws_beyond_loopback_is_refused() {
+    use plexus_dyn::{check_url, Refusal};
+    for ok in ["ws://127.0.0.1:1", "ws://127.9.9.9/x", "ws://localhost:80", "ws://LOCALHOST.", "ws://[::1]:4", "ws://u:p@127.0.0.1:1", "wss://example.com", "wss://10.0.0.1:443/ws"] {
+        assert_eq!(check_url(ok, false), Ok(()), "{ok}");
+    }
+    for bad in ["ws://example.com", "ws://10.0.0.1:1", "ws://[::2]:1", "ws://127.0.0.1.example.com", "ws://localhost.example.com:1", "ws://u@example.com", "http://127.0.0.1", "ws://"] {
+        assert_eq!(check_url(bad, false).map_err(|e| e.0), Err(Refusal::InsecureTransport), "{bad}");
+    }
+    assert_eq!(check_url("ws://example.com", true), Ok(()), "the override");
+    let port = free_port();
+    let far = far(port, false).await;
+    let r = rig().await;
+    let refused = call(&r, ADMIN, "dyn.connect", json!({ "name": "x", "url": "ws://example.com" })).await;
+    assert_eq!((refused[0]["type"].as_str(), refused[0]["reason"].as_str()), (Some("refused"), Some("insecure_transport")), "{refused:?}");
+    assert!(r.dyn_.list().is_empty(), "nothing kept");
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://localhost:{port}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let listed = call(&r, VIEWER, "dyn.peers", json!({})).await;
+    assert_eq!(listed[0]["identity"], json!({ "backend": "far" }), "pinned at connect: {listed:?}");
+    assert!(listed[0].get("insecure").is_none(), "loopback is not insecure: {listed:?}");
+    stop(far).await;
+}
+
+async fn the_insecure_override_is_said() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("peers.toml");
+    std::fs::write(&file, "far = \"ws://example.invalid:1\"\n").unwrap();
+    // Without the override: listed down, saying why, never dialed.
+    let r = rig_with(Some(file.clone())).await;
+    let p = peer(&r, "far");
+    assert!(!p.up && p.why.as_deref().is_some_and(|w| w.contains("plain ws://")), "{p:?}");
+    assert!(p.insecure, "{p:?}");
+    // With it: dialed (and failing here: no such host), and said.
+    let r = rig_opts(Some(file), |o| o.insecure_ws = true).await;
+    let p = peer(&r, "far");
+    assert!(!p.up && p.why.as_deref().is_some_and(|w| !w.contains("plain ws://")), "{p:?}");
+    let listed = call(&r, VIEWER, "dyn.peers", json!({})).await;
+    assert_eq!(listed[0]["insecure"], true, "{listed:?}");
+}
+
+/// A test CA (rcgen), its PEM in `dir`, and leaves for 127.0.0.1.
+struct Pki {
+    dir: tempfile::TempDir,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name.push(rcgen::DnType::CommonName, "DYNAUTH-8 test CA");
+        let ca = params.self_signed(&key).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ca.pem"), ca.pem()).unwrap();
+        Self { dir, issuer: rcgen::Issuer::new(params, key) }
+    }
+
+    fn roots(&self) -> PathBuf {
+        self.dir.path().join("ca.pem")
+    }
+
+    /// A fresh leaf (a fresh key), written as `<name>.crt` / `<name>.key`.
+    fn leaf(&self, name: &str) -> plexus_transport::TlsConfig {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap().signed_by(&key, &self.issuer).unwrap();
+        let (c, k) = (self.dir.path().join(format!("{name}.crt")), self.dir.path().join(format!("{name}.key")));
+        std::fs::write(&c, cert.pem()).unwrap();
+        std::fs::write(&k, key.serialize_pem()).unwrap();
+        plexus_transport::TlsConfig::new(c, k)
+    }
+}
+
+/// The far service over TLS on `port`.
+async fn far_tls(port: u16, tls: plexus_transport::TlsConfig) -> plexus_transport::ServerHandle {
+    let module = DynamicHub::arc_into_rpc_module(Arc::new(DynamicHub::new("far").register(WeatherActivation))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let config = plexus_transport::WebSocketConfig::new(port).with_tls(tls.clone());
+        match plexus_transport::websocket::serve_websocket_with(module.clone(), config, None, Default::default()).await {
+            Ok((h, _)) => return h,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("port {port}: {e}"),
+        }
+    }
+}
+
+async fn a_wss_peer_is_validated_and_its_key_pinned() {
+    let pki = Pki::new();
+    let port = free_port();
+    let url = format!("wss://127.0.0.1:{port}");
+    let first = far_tls(port, pki.leaf("one")).await;
+    // Not trusting the CA: the certificate does not validate.
+    let r = rig().await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
+    assert_eq!(got[0]["type"], "error", "an unknown issuer is refused: {got:?}");
+    assert!(got[0]["message"].as_str().is_some_and(|m| m.to_lowercase().contains("certificate")), "{got:?}");
+    // Trusting it: mounted, its key pinned.
+    let r = rig_opts(None, |o| o.child.tls_roots = Some(pki.roots())).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    assert_eq!(call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    let pinned = peer(&r, "w").identity.expect("pinned");
+    assert!(pinned.tls_key.as_ref().is_some_and(|k| k.len() == 64), "{pinned:?}");
+    // The far side restarts under another key: the redial is refused, and
+    // so is every remount, until it is connected again with `replace`.
+    let _ = first.stop();
+    first.stopped().await;
+    let second = far_tls(port, pki.leaf("two")).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await;
+        let p = peer(&r, "w");
+        if p.why.as_deref().is_some_and(|w| w.contains("identity")) {
+            assert!(got.len() < 7 && !p.up, "{got:?} {p:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "a new key was never refused: {got:?} {p:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await; // a look or two: the remount refused too
+    let p = peer(&r, "w");
+    assert!(!p.up && p.identity.as_ref() == Some(&pinned) && p.why.as_deref().is_some_and(|w| w.contains("replace")), "{p:?}");
+    let again = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url, "replace": true })).await;
+    assert_eq!(again[0]["type"], "connected", "{again:?}");
+    let p = peer(&r, "w");
+    assert!(p.up && p.identity.as_ref().is_some_and(|i| i.tls_key != pinned.tls_key), "re-pinned: {p:?}");
+    assert_eq!(call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    let _ = second.stop();
+}
+
+// ------------------------------------------------------------------ DYNAUTH-9
+
+const SECRET_ENV: &str = "PLEXUS_DYN_TEST_SECRET";
+const PASSED_ENV: &str = "PLEXUS_DYN_TEST_PASSED";
+
+const PROBE: &str = r#"// A dendrite that looks around: what it may read and write, and what it sees.
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
+
+/** Try to read `path`: whether it could, and the error's code if not. */
+export async function read({ path }: { path: string }) {
+  try { readFileSync(path); return { ok: true, code: "" }; } catch (e) { return { ok: false, code: String((e as { code?: string }).code ?? e) }; }
+}
+
+/** Try to list the directory `path`. */
+export async function list({ path }: { path: string }) {
+  try { readdirSync(path); return { ok: true, code: "" }; } catch (e) { return { ok: false, code: String((e as { code?: string }).code ?? e) }; }
+}
+
+/** Try to write `path`. */
+export async function write({ path }: { path: string }) {
+  try { writeFileSync(path, "x"); return { ok: true, code: "" }; } catch (e) { return { ok: false, code: String((e as { code?: string }).code ?? e) }; }
+}
+
+/** An environment variable, its HOME and where it runs. */
+export async function env({ name }: { name: string }) {
+  return { value: process.env[name] ?? "", home: process.env.HOME ?? "", cwd: process.cwd() };
+}
+"#;
+
+fn landlock_here() -> bool {
+    std::fs::read_to_string("/sys/kernel/security/lsm").is_ok_and(|l| l.split(',').any(|m| m.trim() == "landlock"))
+}
+
+async fn a_grown_dendrite_is_contained() {
+    let keys = tempfile::tempdir().unwrap();
+    let key = keys.path().join("host.key");
+    std::fs::write(&key, "a host's signing key").unwrap();
+    let landlock = landlock_here();
+    let r = rig_opts(None, |o| {
+        o.child.env = vec![SECRET_ENV.into(), PASSED_ENV.into()];
+        o.contain.env = vec![PASSED_ENV.into()];
+        o.contain.deny = vec![keys.path().to_path_buf()];
+        o.contain.require = landlock;
+    })
+    .await;
+    let data = r.dyn_.options().data_dir.clone();
+    std::fs::create_dir_all(data.join("other")).unwrap();
+    std::fs::write(data.join("other/secret.txt"), "another dendrite's").unwrap();
+    let grown = call(&r, ADMIN, "dyn.grow", json!({ "name": "probe", "source": PROBE, "targets": [] })).await;
+    assert_eq!(grown[0]["type"], "connected", "{grown:?}");
+    let own = data.join("probe");
+    let read = |p: PathBuf| {
+        let r = &r;
+        async move { call(r, ADMIN, "dyn.peer.probe.read", json!({ "path": p.display().to_string() })).await.remove(0) }
+    };
+    // The environment: the host's secret is not there; what it was given is.
+    let env = call(&r, ADMIN, "dyn.peer.probe.env", json!({ "name": SECRET_ENV })).await.remove(0);
+    assert_eq!(env["value"], "", "the host's environment reached the dendrite: {env:?}");
+    assert!(env["home"].as_str().is_some_and(|h| h.ends_with("probe/.home")), "its own HOME: {env:?}");
+    assert!(env["cwd"].as_str().is_some_and(|c| c.ends_with("/probe")), "its own directory: {env:?}");
+    let passed = call(&r, ADMIN, "dyn.peer.probe.env", json!({ "name": PASSED_ENV })).await.remove(0);
+    assert_eq!(passed["value"], "given", "{passed:?}");
+    // Its own directory: read and written.
+    assert_eq!(read(own.join("index.ts")).await["ok"], true);
+    let w = call(&r, ADMIN, "dyn.peer.probe.write", json!({ "path": own.join("note.txt").display().to_string() })).await.remove(0);
+    assert_eq!(w["ok"], true, "{w:?}");
+    if !landlock {
+        println!("measure: no Landlock on this kernel: the environment is cleared, the files are not denied");
+        return;
+    }
+    // The key, another dendrite's directory, ~/.plexus: refused.
+    for denied in [key.clone(), data.join("other/secret.txt")] {
+        let got = read(denied.clone()).await;
+        assert_eq!((got["ok"].as_bool(), got["code"].as_str()), (Some(false), Some("EACCES")), "{}: {got:?}", denied.display());
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(k) = std::fs::read_dir(home.join(".plexus/keys")).ok().and_then(|mut d| d.next()).and_then(Result::ok) {
+            let got = read(k.path()).await;
+            assert_eq!(got["code"], "EACCES", "~/.plexus/keys: {got:?}");
+        }
+    }
+    // DYNAUTH-22: every secret store of this machine's user that is there —
+    // a file read, a directory listed — refused.
+    let stores = Containment::default_deny(&data);
+    let mut seen = 0;
+    for store in stores.iter().skip(1) {
+        let (method, what) = if store.is_dir() { ("dyn.peer.probe.list", "listed") } else { ("dyn.peer.probe.read", "read") };
+        let got = call(&r, ADMIN, method, json!({ "path": store.display().to_string() })).await.remove(0);
+        assert_eq!((got["ok"].as_bool(), got["code"].as_str()), (Some(false), Some("EACCES")), "{} {what}: {got:?}", store.display());
+        seen += 1;
+    }
+    println!("measure: {seen} secret stores present here, each refused");
+    let w = call(&r, ADMIN, "dyn.peer.probe.write", json!({ "path": data.join("other/planted.txt").display().to_string() })).await.remove(0);
+    assert_eq!(w["code"], "EACCES", "{w:?}");
+    assert!(!data.join("other/planted.txt").exists());
+}
+
+async fn a_dendrite_without_its_launcher() {
+    let r = rig_opts(None, |o| {
+        o.contain.launcher = Some(PathBuf::from("/nonexistent/plexus-dyn-contain"));
+        o.contain.require = true;
+    })
+    .await;
+    let refused = call(&r, ADMIN, "dyn.grow", json!({ "name": "probe", "source": PROBE, "targets": [] })).await;
+    assert_eq!(refused[0]["type"], "error", "{refused:?}");
+    assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("required")), "{refused:?}");
+    // Not required: it runs, with the environment cleared all the same.
+    let r = rig_opts(None, |o| {
+        o.contain.launcher = Some(PathBuf::from("/nonexistent/plexus-dyn-contain"));
+        o.child.env = vec![SECRET_ENV.into()];
+    })
+    .await;
+    let grown = call(&r, ADMIN, "dyn.grow", json!({ "name": "probe", "source": PROBE, "targets": [] })).await;
+    assert_eq!(grown[0]["type"], "connected", "{grown:?}");
+    let env = call(&r, ADMIN, "dyn.peer.probe.env", json!({ "name": SECRET_ENV })).await.remove(0);
+    assert_eq!(env["value"], "", "{env:?}");
+    assert!(env["home"].as_str().is_some_and(|h| h.ends_with("probe/.home")), "{env:?}");
+}
+
 fn main() {
+    // DYNAUTH-9: a secret in the host's environment (and one it means to pass).
+    std::env::set_var(SECRET_ENV, "s3cret-dynauth9");
+    std::env::set_var(PASSED_ENV, "given");
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(async {
         macro_rules! run {
@@ -575,7 +844,12 @@ fn main() {
             a_peer_grows_the_top_level,
             dyn_client_reaches_a_peer_untyped_and_typed,
             connect_expecting_refuses_another_interface,
-            a_dendrite_whose_needs_are_not_served_is_refused
+            a_dendrite_whose_needs_are_not_served_is_refused,
+            ws_beyond_loopback_is_refused,
+            the_insecure_override_is_said,
+            a_wss_peer_is_validated_and_its_key_pinned,
+            a_grown_dendrite_is_contained,
+            a_dendrite_without_its_launcher
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });
