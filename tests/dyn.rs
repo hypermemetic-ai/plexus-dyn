@@ -17,6 +17,11 @@
 //!   allowed and said (`insecure`); a `wss://` peer's certificate validated
 //!   and its key pinned — a restart with another key refused
 //!   (`identity_changed`) until it is connected again with `replace`.
+//! - DYNAUTH-9: a grown dendrite is contained — it cannot read a key file,
+//!   another dendrite's directory or `~/.plexus`, nor see the host's
+//!   environment; it reads and writes its own directory. Without its
+//!   launcher it is refused when containment is required, else run with a
+//!   cleared environment.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -156,6 +161,8 @@ async fn rig_opts(peers_file: Option<PathBuf>, tweak: impl FnOnce(&mut DynOption
         peers_file,
         ..DynOptions::default()
     };
+    // DYNAUTH-9: every dendrite here runs contained, by this build's launcher.
+    opts.contain.launcher = Some(PathBuf::from(env!("CARGO_BIN_EXE_plexus-dyn-contain")));
     tweak(&mut opts);
     let dyn_ = DynActivation::new(opts);
     let plain = DynamicHub::new("host").register(dyn_.clone());
@@ -560,7 +567,113 @@ async fn a_wss_peer_is_validated_and_its_key_pinned() {
     let _ = second.stop();
 }
 
+// ------------------------------------------------------------------ DYNAUTH-9
+
+const SECRET_ENV: &str = "PLEXUS_DYN_TEST_SECRET";
+const PASSED_ENV: &str = "PLEXUS_DYN_TEST_PASSED";
+
+const PROBE: &str = r#"// A dendrite that looks around: what it may read and write, and what it sees.
+import { readFileSync, writeFileSync } from "node:fs";
+
+/** Try to read `path`: whether it could, and the error's code if not. */
+export async function read({ path }: { path: string }) {
+  try { readFileSync(path); return { ok: true, code: "" }; } catch (e) { return { ok: false, code: String((e as { code?: string }).code ?? e) }; }
+}
+
+/** Try to write `path`. */
+export async function write({ path }: { path: string }) {
+  try { writeFileSync(path, "x"); return { ok: true, code: "" }; } catch (e) { return { ok: false, code: String((e as { code?: string }).code ?? e) }; }
+}
+
+/** An environment variable, its HOME and where it runs. */
+export async function env({ name }: { name: string }) {
+  return { value: process.env[name] ?? "", home: process.env.HOME ?? "", cwd: process.cwd() };
+}
+"#;
+
+fn landlock_here() -> bool {
+    std::fs::read_to_string("/sys/kernel/security/lsm").is_ok_and(|l| l.split(',').any(|m| m.trim() == "landlock"))
+}
+
+async fn a_grown_dendrite_is_contained() {
+    let keys = tempfile::tempdir().unwrap();
+    let key = keys.path().join("host.key");
+    std::fs::write(&key, "a host's signing key").unwrap();
+    let landlock = landlock_here();
+    let r = rig_opts(None, |o| {
+        o.child.env = vec![SECRET_ENV.into(), PASSED_ENV.into()];
+        o.contain.env = vec![PASSED_ENV.into()];
+        o.contain.deny = vec![keys.path().to_path_buf()];
+        o.contain.require = landlock;
+    })
+    .await;
+    let data = r.dyn_.options().data_dir.clone();
+    std::fs::create_dir_all(data.join("other")).unwrap();
+    std::fs::write(data.join("other/secret.txt"), "another dendrite's").unwrap();
+    let grown = call(&r, ADMIN, "dyn.grow", json!({ "name": "probe", "source": PROBE, "targets": [] })).await;
+    assert_eq!(grown[0]["type"], "connected", "{grown:?}");
+    let own = data.join("probe");
+    let read = |p: PathBuf| {
+        let r = &r;
+        async move { call(r, ADMIN, "dyn.peer.probe.read", json!({ "path": p.display().to_string() })).await.remove(0) }
+    };
+    // The environment: the host's secret is not there; what it was given is.
+    let env = call(&r, ADMIN, "dyn.peer.probe.env", json!({ "name": SECRET_ENV })).await.remove(0);
+    assert_eq!(env["value"], "", "the host's environment reached the dendrite: {env:?}");
+    assert!(env["home"].as_str().is_some_and(|h| h.ends_with("probe/.home")), "its own HOME: {env:?}");
+    assert!(env["cwd"].as_str().is_some_and(|c| c.ends_with("/probe")), "its own directory: {env:?}");
+    let passed = call(&r, ADMIN, "dyn.peer.probe.env", json!({ "name": PASSED_ENV })).await.remove(0);
+    assert_eq!(passed["value"], "given", "{passed:?}");
+    // Its own directory: read and written.
+    assert_eq!(read(own.join("index.ts")).await["ok"], true);
+    let w = call(&r, ADMIN, "dyn.peer.probe.write", json!({ "path": own.join("note.txt").display().to_string() })).await.remove(0);
+    assert_eq!(w["ok"], true, "{w:?}");
+    if !landlock {
+        println!("measure: no Landlock on this kernel: the environment is cleared, the files are not denied");
+        return;
+    }
+    // The key, another dendrite's directory, ~/.plexus: refused.
+    for denied in [key.clone(), data.join("other/secret.txt")] {
+        let got = read(denied.clone()).await;
+        assert_eq!((got["ok"].as_bool(), got["code"].as_str()), (Some(false), Some("EACCES")), "{}: {got:?}", denied.display());
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(k) = std::fs::read_dir(home.join(".plexus/keys")).ok().and_then(|mut d| d.next()).and_then(Result::ok) {
+            let got = read(k.path()).await;
+            assert_eq!(got["code"], "EACCES", "~/.plexus/keys: {got:?}");
+        }
+    }
+    let w = call(&r, ADMIN, "dyn.peer.probe.write", json!({ "path": data.join("other/planted.txt").display().to_string() })).await.remove(0);
+    assert_eq!(w["code"], "EACCES", "{w:?}");
+    assert!(!data.join("other/planted.txt").exists());
+}
+
+async fn a_dendrite_without_its_launcher() {
+    let r = rig_opts(None, |o| {
+        o.contain.launcher = Some(PathBuf::from("/nonexistent/plexus-dyn-contain"));
+        o.contain.require = true;
+    })
+    .await;
+    let refused = call(&r, ADMIN, "dyn.grow", json!({ "name": "probe", "source": PROBE, "targets": [] })).await;
+    assert_eq!(refused[0]["type"], "error", "{refused:?}");
+    assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("required")), "{refused:?}");
+    // Not required: it runs, with the environment cleared all the same.
+    let r = rig_opts(None, |o| {
+        o.contain.launcher = Some(PathBuf::from("/nonexistent/plexus-dyn-contain"));
+        o.child.env = vec![SECRET_ENV.into()];
+    })
+    .await;
+    let grown = call(&r, ADMIN, "dyn.grow", json!({ "name": "probe", "source": PROBE, "targets": [] })).await;
+    assert_eq!(grown[0]["type"], "connected", "{grown:?}");
+    let env = call(&r, ADMIN, "dyn.peer.probe.env", json!({ "name": SECRET_ENV })).await.remove(0);
+    assert_eq!(env["value"], "", "{env:?}");
+    assert!(env["home"].as_str().is_some_and(|h| h.ends_with("probe/.home")), "{env:?}");
+}
+
 fn main() {
+    // DYNAUTH-9: a secret in the host's environment (and one it means to pass).
+    std::env::set_var(SECRET_ENV, "s3cret-dynauth9");
+    std::env::set_var(PASSED_ENV, "given");
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(async {
         macro_rules! run {
@@ -577,7 +690,9 @@ fn main() {
             the_peers_file_is_connected_at_start,
             ws_beyond_loopback_is_refused,
             the_insecure_override_is_said,
-            a_wss_peer_is_validated_and_its_key_pinned
+            a_wss_peer_is_validated_and_its_key_pinned,
+            a_grown_dendrite_is_contained,
+            a_dendrite_without_its_launcher
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });

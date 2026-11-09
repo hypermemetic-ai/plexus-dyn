@@ -13,6 +13,17 @@ identity (`_info` backend, the TLS key) is pinned at connect, shown in
 Needs the plexus-core after 0.10.1 (`RemoteChild::identity`,
 `ChildOptions::tls_roots`).
 
+DYNAUTH-9 (TM-5): **a grown dendrite, contained.** Spawned through the new
+binary `plexus-dyn-contain`: a cleared environment (own `HOME`, `TMPDIR`),
+its own directory as cwd, and on Linux a Landlock ruleset (landlock 0.4.7,
+best-effort to ABI 9) denying `dyn`'s data directory, `~/.plexus`,
+`~/.ssh`, `~/.gnupg`, `~/.password-store`, the dial key and
+`Containment::deny` — at every path the same files are mounted at — with
+writes only in its own directory, and signals, abstract and by-path UNIX
+sockets scoped. Degrades with a warning; `Containment::require` refuses
+instead. New: `contain` (`Containment`, `launcher_main`),
+`DynOptions::contain`.
+
 ## 0.1.0
 
 NEST-12: the first release. `dyn`, an activation that connects to other

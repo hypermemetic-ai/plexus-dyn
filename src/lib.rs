@@ -29,6 +29,15 @@
 //! it is connected; a redial or remount that proves another is refused
 //! (`identity_changed`) until it is connected again with `replace`.
 //!
+//! **Containment** (DYNAUTH-9, TM-5): a dendrite is spawned through
+//! `plexus-dyn-contain` ([`contain`]): a cleared environment (its own
+//! `HOME` and `TMPDIR`), its own directory, and on Linux a Landlock ruleset
+//! that denies it `dyn`'s data directory, `~/.plexus`, `~/.ssh`, `~/.gnupg`,
+//! `~/.password-store`, the dial key and [`Containment::deny`]. Where
+//! Landlock is not there it runs with the cleared environment and a
+//! warning, unless [`Containment::require`]. `dyn.grow` stays the admin's:
+//! until microVMs a dendrite is host-equivalent trust.
+//!
 //! The slot is untyped: a call is admitted on the slot grant `dyn.{peer}` (or
 //! a literal path a role lists, `dyn.peer.digest.rainy`), held by `admin`
 //! unless a role lists it, and the peer decides again inside it.
@@ -52,6 +61,8 @@
 //! via = ["weather.weather"]
 //! ```
 
+pub mod contain;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -61,6 +72,8 @@ use futures::Stream;
 use plexus_core::plexus::peer::{Peer, PeerError};
 use plexus_core::plexus::{ChildOptions, ChildSpec, DynamicHub, RemoteChild, WeakService};
 use schemars::JsonSchema;
+
+pub use contain::Containment;
 use serde::{Deserialize, Serialize};
 
 /// How `dyn` runs.
@@ -83,6 +96,8 @@ pub struct DynOptions {
     /// ceiling) crosses it in clear. Each such peer says `insecure` in
     /// `dyn.peers`.
     pub insecure_ws: bool,
+    /// DYNAUTH-9: how a dendrite is contained.
+    pub contain: Containment,
 }
 
 impl Default for DynOptions {
@@ -95,6 +110,7 @@ impl Default for DynOptions {
             liveness: Duration::from_secs(5),
             peers_file: None,
             insecure_ws: false,
+            contain: Containment::default(),
         }
     }
 }
@@ -361,6 +377,7 @@ impl DynActivation {
                     let paths: Vec<String> = via.iter().map(|t| format!("{}=dyn.peer.{t}", t.rsplit('.').next().unwrap_or(t))).collect();
                     argv.extend(["--via-host".into(), paths.join(",")]);
                 }
+                let argv = self.inner.opts.contain.wrap(Path::new(dir), &self.denied(), argv)?;
                 Ok(ChildSpec::Stdio { name: name.into(), argv })
             }
         }
@@ -499,6 +516,15 @@ impl DynActivation {
             Some(_) => self.mount(name, true).await.map_err(|reason| PeerError::Unavailable { reason }),
             None => self.mount(name, false).await.map_err(|reason| PeerError::Unavailable { reason }),
         }
+    }
+
+    /// DYNAUTH-9: what no dendrite may read.
+    fn denied(&self) -> Vec<PathBuf> {
+        let o = &self.inner.opts;
+        let mut out = Containment::default_deny(&o.data_dir);
+        out.extend(o.child.key.iter().cloned());
+        out.extend(o.contain.deny.iter().cloned());
+        out
     }
 
     fn data_dir_for(&self, name: &str) -> PathBuf {

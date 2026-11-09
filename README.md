@@ -62,6 +62,36 @@ same key is the same peer). `dyn.peers` shows it (`identity`). A redial or a
 remount that proves another is refused (`identity_changed`), the peer listed
 down saying why, until it is connected again with `replace`.
 
+## A dendrite, contained (DYNAUTH-9)
+
+A dendrite is arbitrary code run as the host's OS user, so `dyn.grow` is
+the admin's and host-equivalent trust until dendrites run in microVMs. The
+floor beneath that: each is spawned through **`plexus-dyn-contain`** (this
+crate's binary, found beside the service's executable or on `PATH`; or
+`DynOptions::contain.launcher`), which
+
+- clears its environment — `PATH`, `LANG` and `PLEXUS_CHILD_NAME` pass,
+  and each name of `contain.env` (it must also be in `child.env`, which
+  takes it from the service's); `HOME` is `<dir>/.home`, `TMPDIR`
+  `<dir>/.tmp`;
+- starts it in its own directory;
+- on Linux, restricts it with **Landlock** before it executes: it reads
+  everything but `dyn`'s data directory (every other dendrite's),
+  `~/.plexus`, `~/.ssh`, `~/.gnupg`, `~/.password-store`, the dial key
+  (`child.key`) and each path of `contain.deny` (the host's signing key, a
+  bridge's sealed store) — wherever those are also mounted (a bind mount,
+  a btrfs subvolume); it writes only its own directory (and `/dev/null`);
+  on kernels that have them, it may not signal a process outside it, reach
+  an abstract UNIX socket made outside it, or connect to a UNIX socket by
+  path outside its directory (Linux 7.1: no Docker socket, no signed-in
+  synapse holder).
+
+Where Landlock is not there (an old kernel, another OS) the dendrite runs
+with the cleared environment and the launcher logs a warning; where the
+launcher is not found, with `env -i` and a warning.
+`contain.require` refuses to start one that cannot be contained instead.
+The network is not restricted.
+
 ## In a service
 
 ```rust
@@ -103,7 +133,11 @@ and remounted; a dendrite grown against a peer calling it through the host
 down by the ping; a live one staying up; the peers file; `ws://` beyond
 loopback refused, or allowed and said; a `wss://` peer (a test CA, rcgen)
 refused untrusted, pinned trusted, and refused once it restarts under
-another key until it is connected again. The dendrite needs
+another key until it is connected again; a contained
+dendrite refused a key file, another dendrite's file and `~/.plexus/keys`,
+seeing none of the host's environment, reading and writing its own
+directory; one whose launcher is missing refused when containment is
+required, else run with a cleared environment. The dendrite needs
 `plexus-dendrite` (the sibling checkout, or `PLEXUS_DENDRITE`) and Node 22.
 
 ## Rough
