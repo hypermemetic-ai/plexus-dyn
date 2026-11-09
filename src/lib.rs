@@ -1197,51 +1197,11 @@ impl DynActivation {
 
 /// DYNAUTH-8 (TM-3): whether `url` may be dialed — `wss://` anywhere,
 /// `ws://` only to loopback (`127.0.0.0/8`, `::1`, `localhost`) unless
-/// `insecure` allows it. `Err`: the refusal, said.
+/// `insecure` allows it. `Err`: the refusal, said. KEEL-7: plexus-core's
+/// [`check_ws_url`](plexus_core::plexus::check_ws_url) decides, the one
+/// every dial of the service asks; this names its reason.
 pub fn check_url(url: &str, insecure: bool) -> Result<(), (Refusal, String)> {
-    let rest = if let Some(r) = url.strip_prefix("wss://") {
-        return match host_of(r) {
-            Some(_) => Ok(()),
-            None => Err((Refusal::InsecureTransport, format!("`{url}` names no host"))),
-        };
-    } else if let Some(r) = url.strip_prefix("ws://") {
-        r
-    } else {
-        return Err((Refusal::InsecureTransport, format!("`{url}`: a peer is reached by ws:// or wss://")));
-    };
-    let Some(host) = host_of(rest) else { return Err((Refusal::InsecureTransport, format!("`{url}` names no host"))) };
-    if is_loopback(&host) || insecure {
-        return Ok(());
-    }
-    Err((
-        Refusal::InsecureTransport,
-        format!("`{url}`: plain ws:// only to loopback (127.0.0.0/8, ::1, localhost); a peer beyond it is reached by wss://, its hop (who calls, under what ceiling) never in clear"),
-    ))
-}
-
-/// The host of `authority[/path]`: no user info, no port, an IPv6
-/// literal without its brackets, lower case.
-fn host_of(rest: &str) -> Option<String> {
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let host = if let Some(v6) = authority.strip_prefix('[') {
-        v6.split_once(']')?.0
-    } else {
-        authority.split(':').next().unwrap_or("")
-    };
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
-}
-
-fn is_loopback(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    if host == "localhost" {
-        return true;
-    }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(a)) => a.is_loopback(),
-        Ok(std::net::IpAddr::V6(a)) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
-        Err(_) => false,
-    }
+    plexus_core::plexus::check_ws_url(url, insecure).map_err(|why| (Refusal::InsecureTransport, why))
 }
 
 fn identity_changed(name: &str, pinned: &PeerIdentity, proved: &PeerIdentity) -> String {

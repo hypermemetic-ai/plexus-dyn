@@ -5,6 +5,11 @@
 On plexus-core, plexus-macros and plexus-client 0.11 (NEST-24): a new minor,
 since 0.1.0 is on plexus-core 0.10.1 and this one cannot share its number.
 
+KEEL-7: `check_url` decides by plexus-core's `check_ws_url` (the one
+loopback/scheme function every dial of the service asks), keeping no copy;
+its refusal now also names `transport.insecure_ws`. A mount's options carry
+`transport.insecure_ws` to plexus-core's dial, which refuses on its own too.
+
 NEST-21: **settings and re-pinning.** `dyn` reads the service's
 configuration (plexus-core's `config`; `DynOptions::config`, else the
 service's at `start`) at every connect, mount and spawn:
