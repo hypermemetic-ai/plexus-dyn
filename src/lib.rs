@@ -257,6 +257,33 @@ pub enum Refusal {
     IdentityChanged,
 }
 
+/// DYNAUTH-6: what `dyn.exchange` answers (RFC 8693 §2.2's response, as
+/// a stream item).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExchangeEvent {
+    /// The token for the audience.
+    Exchanged {
+        access_token: String,
+        /// `urn:ietf:params:oauth:token-type:jwt`.
+        issued_token_type: String,
+        /// `N_A`: not a bearer token — bound to the audience's key.
+        token_type: String,
+        /// What it holds (never more than the subject token held).
+        scope: Vec<String>,
+        /// Seconds it lives.
+        expires_in: u64,
+    },
+    /// Refused, and why (never the token).
+    Error { message: String },
+}
+
+impl plexus_client::FromClientError for ExchangeEvent {
+    fn from_client_error(e: plexus_client::ClientError) -> Self {
+        ExchangeEvent::Error { message: e.to_string() }
+    }
+}
+
 /// What `connect`, `grow` and `disconnect` answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -305,6 +332,8 @@ struct Inner {
     store: Mutex<consent::Store>,
     /// DYNAUTH-12: the peer-token issuer (its key in `key_file`).
     issuer: Arc<TokenIssuer>,
+    /// DYNAUTH-6: the exchange proofs seen, each once.
+    proofs: plexus_core::plexus::peer_token::ProofCache,
 }
 
 impl consent::ConsentSource for Inner {
@@ -363,6 +392,7 @@ impl DynActivation {
                 top: Mutex::default(),
                 store: Mutex::new(consent::Store::default()),
                 issuer,
+                proofs: Default::default(),
             }),
         }
         .loaded()
@@ -387,6 +417,14 @@ impl DynActivation {
     /// DYNAUTH-12: the issuer (the signing key's id, its rotation, DYNAUTH-7).
     pub fn issuer(&self) -> &Arc<TokenIssuer> {
         &self.inner.issuer
+    }
+
+    /// DYNAUTH-6: [`DynActivation::exchange`]'s work.
+    pub fn exchange_for(&self, subject: &str, proof: &str, audience: &str, scope: Option<&[String]>, method: &str) -> Result<(String, plexus_core::plexus::peer_token::PeerClaims), String> {
+        let child = self.inner.peers.lock().unwrap().get(audience).and_then(|e| e.child.clone());
+        let key = child.as_ref().and_then(|c| c.peer_key().map(str::to_string)).ok_or_else(|| format!("no connected peer `{audience}` that proved a key: a token is only exchanged for one"))?;
+        let call = uuid::Uuid::new_v4().to_string();
+        self.inner.issuer.exchange(subject, Some(proof), audience, Some(key), scope, &call, method, &self.inner.proofs).map_err(|e| format!("the exchange is refused: {e}"))
     }
 
     /// DYNAUTH-5: the consent kept in the data directory, read at start.
@@ -1034,6 +1072,27 @@ impl DynActivation {
     #[plexus_macros::method]
     pub async fn consents(&self) -> impl Stream<Item = ConsentInfo> + Send + 'static {
         futures::stream::iter(self.consent_list())
+    }
+
+    /// DYNAUTH-6: RFC 8693 token exchange. `subject_token`, a token this
+    /// service minted for a peer, presented by that peer with `proof` (its
+    /// proof of possession for method `exchange` under the token's `call`),
+    /// becomes a token for the connected peer `audience` (one that proved a
+    /// key): the same `sub`, the presenter added to `act`, `scope` the one
+    /// asked (all of the subject's when absent) narrowed to the subject's,
+    /// never wider. A token bound to no key (a pipe's) is not exchanged.
+    #[plexus_macros::method(public)]
+    pub async fn exchange(&self, subject_token: String, proof: String, audience: String, scope: Option<Vec<String>>, method: Option<String>) -> ExchangeEvent {
+        match self.exchange_for(&subject_token, &proof, &audience, scope.as_deref(), method.as_deref().unwrap_or_default()) {
+            Ok((access_token, claims)) => ExchangeEvent::Exchanged {
+                access_token,
+                issued_token_type: plexus_core::plexus::peer_token::JWT_TOKEN_TYPE.into(),
+                token_type: "N_A".into(),
+                scope: claims.scope,
+                expires_in: claims.exp.saturating_sub(claims.iat),
+            },
+            Err(message) => ExchangeEvent::Error { message },
+        }
     }
 
     /// DYNAUTH-12: the keys this service signs its peers' tokens with (a
