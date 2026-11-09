@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+DYNAUTH-7: **revocation and audit.** `dyn.revoke { peer, why? }` (admin):
+nothing is forwarded to it from now (no token minted), its calls back end,
+its consent goes, and it stays listed as revoked (`PeerInfo::revoked`,
+`dyn.consents`' `revoked`) until an admin connects or grows it again with
+`replace`; a token already issued expires within 60 s. `dyn.rotate_key`
+(admin): a new signing key from now (the key file replaced), the old one in
+`dyn.jwks` for one token lifetime and the skew. `DynOptions::audit`
+(`Audit`, a `TokenAudit` sink) beside the `plexus::audit` event for every
+mint and exchange. New: `DynEvent::{Revoked, Rotated}`,
+`DynActivation::{revoke_peer, rotate_signing_key}`.
+
 DYNAUTH-6: **token exchange.** A peer calling onward through the host gets
 the next peer a token by exchange (plexus-core): the caller stays `sub`,
 the presenter joins `act`, the scope never widens. `dyn.exchange {
