@@ -12,6 +12,8 @@
 //! dyn.names                                  each peer's name: the slot's list            (viewer)
 //! dyn.consent   { peer, needs?, callers? }   what a peer may call up; who may call it    (admin)
 //! dyn.consents                               each peer's key, declared needs, consent     (viewer)
+//! dyn.pins                                   each peer's pin, and what it presented       (viewer)
+//! dyn.repin     { name, fingerprint }        pin the presented identity, by its print     (admin)
 //! dyn.peer.<name>.<path>.<method>            a call into a peer, gated by `dyn.{peer}`
 //!                                            or a role its consent names
 //! ```
@@ -39,6 +41,19 @@
 //! `_info` backend, and on `wss://` its certificate's key — is pinned when
 //! it is connected; a redial or remount that proves another is refused
 //! (`identity_changed`) until it is connected again with `replace`.
+//!
+//! **Settings** (NEST-21, [`settings`]): `dyn` reads the service's
+//! configuration (`plexus_core::plexus::config`) at every connect, mount
+//! and spawn — `transport.insecure_ws`, `transport.tls_roots`, `child.*`,
+//! `dyn.repin_on_valid_cert`, `dyn.containment.deny` / `require`,
+//! `dyn.require_consent` — so a set through the `config` activation takes
+//! effect at the next one. What [`DynOptions`] says is their flag layer.
+//! **Re-pinning**: a peer refused for another identity keeps what it
+//! presented (`dyn.pins`); `dyn.repin { name, fingerprint }` pins it only
+//! when `fingerprint` is exactly that identity's, so nobody accepts blind.
+//! With `dyn.repin_on_valid_cert` (off, NEST-18 D33) a certificate whose key
+//! moved under a valid chain, the backend and the peer's own key the same,
+//! is re-pinned by itself.
 //!
 //! **Containment** (DYNAUTH-9, TM-5): a dendrite is spawned through
 //! `plexus-dyn-contain` ([`contain`]): a cleared environment (its own
@@ -99,6 +114,8 @@
 pub mod contain;
 // DYNAUTH-5: a peer's registration and an admin's consent.
 pub mod consent;
+// NEST-21: dyn's settings, on the service's configuration.
+pub mod settings;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,6 +125,7 @@ use std::time::Duration;
 use futures::Stream;
 use plexus_core::plexus::peer::{Peer, PeerError};
 use plexus_core::plexus::peer_token::{Jwks, PeerKey, TokenIssuer};
+use plexus_core::plexus::config::{settings as core_settings, Config, Source};
 use plexus_core::plexus::{ChildOptions, ChildSpec, DynamicHub, RemoteChild, ServiceRoot, WeakService};
 use schemars::JsonSchema;
 
@@ -153,6 +171,15 @@ pub struct DynOptions {
     /// DYNAUTH-7: where each mint and exchange is recorded, beside the
     /// `plexus::audit` tracing event (PRIVACY-1's sink, when there is one).
     pub audit: Option<Audit>,
+    /// NEST-21: the configuration `dyn` reads its settings from
+    /// (`transport.insecure_ws`, `transport.tls_roots`, `child.*`,
+    /// `dyn.*`). `None`: the service's own ([`DynamicHub::config`]), taken
+    /// at [`DynActivation::start`]. The fields above that a setting
+    /// governs (`insecure_ws`, `require_consent`, `contain.require`,
+    /// `child`'s timeout, max_calls, backoff, legacy_upcalls, tls_roots)
+    /// are its flag layer: what the host was started with, which a runtime
+    /// set goes over and a reset comes back to.
+    pub config: Option<Config>,
 }
 
 /// DYNAUTH-7: an audit sink for [`DynOptions::audit`].
@@ -181,6 +208,7 @@ impl Default for DynOptions {
             tokens: true,
             key_file: None,
             audit: None,
+            config: None,
         }
     }
 }
@@ -230,6 +258,28 @@ pub struct PeerInfo {
     /// DYNAUTH-7: revoked (`dyn.revoke`), and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked: Option<String>,
+    /// NEST-21: the identity it presented and was refused for
+    /// (`identity_changed`), kept for `dyn.repin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presented: Option<PeerIdentity>,
+}
+
+/// NEST-21: one peer's pin, as `dyn.pins` lists it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PinInfo {
+    pub name: String,
+    /// The identity pinned (none until its first mount).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<PeerIdentity>,
+    /// [`PeerIdentity::fingerprint`] of `pinned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// The identity it last presented and was refused for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presented: Option<PeerIdentity>,
+    /// [`PeerIdentity::fingerprint`] of `presented`: what `dyn.repin` takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presented_fingerprint: Option<String>,
 }
 
 /// DYNAUTH-8: who a peer proved it was — its `_info` backend and, on
@@ -242,6 +292,24 @@ pub struct PeerIdentity {
     /// DYNAUTH-5: the Ed25519 key it proved at `_info` (`key:<hex>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+}
+
+impl PeerIdentity {
+    /// NEST-21: the whole identity as one string to compare —
+    /// `sha256:<hex>` over its backend, its certificate's key and its own
+    /// key, each on a line (an absent one empty).
+    pub fn fingerprint(&self) -> String {
+        use sha2::Digest;
+        let text = format!("{}\n{}\n{}", self.backend, self.tls_key.as_deref().unwrap_or(""), self.key.as_deref().unwrap_or(""));
+        let d = sha2::Sha256::digest(text.as_bytes());
+        format!("sha256:{}", d.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    /// NEST-21: the same peer under a renewed certificate: the same backend
+    /// and own key, only the certificate's key moved.
+    fn only_tls_moved(&self, other: &PeerIdentity) -> bool {
+        self.backend == other.backend && self.key == other.key && self.tls_key.is_some() && other.tls_key.is_some() && self.tls_key != other.tls_key
+    }
 }
 
 impl From<&plexus_core::plexus::PeerIdentity> for PeerIdentity {
@@ -272,6 +340,10 @@ pub enum Refusal {
     InsecureTransport,
     /// It proved another identity than the one pinned when it was connected.
     IdentityChanged,
+    /// NEST-21: `dyn.repin`'s fingerprint is not the one the peer presented.
+    FingerprintMismatch,
+    /// NEST-21: `dyn.repin` on a peer that presented nothing refused.
+    NotPresented,
 }
 
 /// DYNAUTH-6: what `dyn.exchange` answers (RFC 8693 §2.2's response, as
@@ -309,8 +381,18 @@ pub enum DynEvent {
     Connected { name: String, interface: String, methods: Vec<String>, replaced: bool },
     /// A peer let go.
     Disconnected { name: String },
-    /// Refused, and why in a word (DYNAUTH-8).
-    Refused { reason: Refusal, message: String },
+    /// Refused, and why in a word (DYNAUTH-8). NEST-21: for an identity,
+    /// the one pinned (`old`) and the one presented.
+    Refused {
+        reason: Refusal,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        old: Option<PeerIdentity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        presented: Option<PeerIdentity>,
+    },
+    /// NEST-21: `name` is pinned to what it presented (`dyn.repin`).
+    Repinned { name: String, old: Option<PeerIdentity>, pinned: PeerIdentity, fingerprint: String, up: bool },
     /// DYNAUTH-5: what `peer` may now do: the needs it may call back up,
     /// and the roles that may call into it.
     Consented { peer: String, needs: Vec<String>, callers: Vec<String> },
@@ -338,6 +420,8 @@ struct Entry {
     expecting: Option<String>,
     /// DYNAUTH-8: who it proved it was at its first mount.
     pin: Option<PeerIdentity>,
+    /// NEST-21: the identity a remount presented and was refused for.
+    presented: Option<PeerIdentity>,
 }
 
 struct Inner {
@@ -356,6 +440,9 @@ struct Inner {
     issuer: Arc<TokenIssuer>,
     /// DYNAUTH-6: the exchange proofs seen, each once.
     proofs: plexus_core::plexus::peer_token::ProofCache,
+    /// NEST-21: where the settings are read: `DynOptions::config`, or the
+    /// service's once started.
+    config: Mutex<Config>,
 }
 
 impl consent::ConsentSource for Inner {
@@ -403,6 +490,7 @@ fn check_name(name: &str) -> Result<(), String> {
 impl DynActivation {
     /// `dyn` with `opts`.
     pub fn new(opts: DynOptions) -> Self {
+        let config = opts.config.clone().unwrap_or_default();
         let mut issuer = TokenIssuer::new(Self::signing_key(&opts));
         if let Some(Audit(sink)) = &opts.audit {
             issuer = issuer.with_audit(Arc::clone(sink));
@@ -419,9 +507,51 @@ impl DynActivation {
                 store: Mutex::new(consent::Store::default()),
                 issuer,
                 proofs: Default::default(),
+                config: Mutex::new(config.clone()),
             }),
         }
         .loaded()
+        .adopted(config)
+    }
+
+    /// NEST-21: the configuration read now.
+    pub fn config(&self) -> Config {
+        self.inner.config.lock().unwrap().clone()
+    }
+
+    /// NEST-21: read the settings from `config`: dyn's declared there, what
+    /// the options say above the defaults put in as its flag layer, and the
+    /// mounted peers held again when `dyn.require_consent` moves.
+    fn adopted(self, config: Config) -> Self {
+        *self.inner.config.lock().unwrap() = config.clone();
+        settings::declare(&config);
+        let o = &self.inner.opts;
+        if o.insecure_ws {
+            config.seed(&core_settings::TRANSPORT_INSECURE_WS, Source::Flag, Some(true));
+        }
+        if !o.require_consent {
+            config.seed(&settings::DYN_REQUIRE_CONSENT, Source::Flag, Some(false));
+        }
+        if o.contain.require {
+            config.seed(&settings::DYN_CONTAINMENT_REQUIRE, Source::Flag, Some(true));
+        }
+        o.child.seed(&config);
+        let weak = Arc::downgrade(&self.inner);
+        config.on_change(&settings::DYN_REQUIRE_CONSENT, move |_| {
+            if let Some(inner) = weak.upgrade() {
+                let this = DynActivation { inner };
+                let mounted: Vec<(String, RemoteChild)> = this.inner.peers.lock().unwrap().iter().filter_map(|(n, e)| e.child.clone().map(|c| (n.clone(), c))).collect();
+                for (name, child) in mounted {
+                    this.hold(&name, &child);
+                }
+            }
+        });
+        self
+    }
+
+    /// NEST-21: `transport.insecure_ws`, now.
+    fn insecure_ws(&self) -> bool {
+        self.config().get(&core_settings::TRANSPORT_INSECURE_WS)
     }
 
     /// DYNAUTH-12: the signing key, from its file (made there when
@@ -531,7 +661,7 @@ impl DynActivation {
     /// DYNAUTH-5: hold `child`'s calls back to what is consented for
     /// `name` (everything declared when consent is not required).
     fn hold(&self, name: &str, child: &RemoteChild) {
-        if !self.inner.opts.require_consent {
+        if !self.config().get(&settings::DYN_REQUIRE_CONSENT) {
             child.set_consent(None);
             return;
         }
@@ -626,6 +756,10 @@ impl DynActivation {
         if self.inner.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
+        // NEST-21: no configuration given: the service's.
+        if self.inner.opts.config.is_none() && !self.config().same(&service.config()) {
+            let _ = self.clone().adopted(service.config());
+        }
         // NEST-15: peers connected before the service was known.
         let mounted: Vec<(String, RemoteChild)> = self.inner.peers.lock().unwrap().iter().filter_map(|(n, e)| e.child.clone().map(|c| (n.clone(), c))).collect();
         for (name, child) in mounted {
@@ -635,7 +769,7 @@ impl DynActivation {
         }
         if let Some(file) = &self.inner.opts.peers_file {
             for (name, kind) in read_peers_file(file)? {
-                self.inner.peers.lock().unwrap().insert(name, Entry { kind, child: None, why: Some("not connected yet".into()), remounts: 0, expecting: None, pin: None });
+                self.inner.peers.lock().unwrap().insert(name, Entry { kind, child: None, why: Some("not connected yet".into()), remounts: 0, expecting: None, pin: None, presented: None });
             }
             let names: Vec<String> = self.inner.peers.lock().unwrap().keys().cloned().collect();
             for name in names {
@@ -745,7 +879,8 @@ impl DynActivation {
 
     /// The options a mount of `kind` takes.
     fn child_options(&self, kind: &PeerKind) -> ChildOptions {
-        let mut o = self.inner.opts.child.clone();
+        // NEST-21: the child.* and transport.tls_roots settings, read at each mount.
+        let mut o = self.inner.opts.child.clone().configured(&self.config());
         if self.inner.opts.tokens {
             o.tokens = Some(Arc::clone(&self.inner.issuer));
         }
@@ -763,7 +898,7 @@ impl DynActivation {
     fn spec(&self, name: &str, kind: &PeerKind) -> Result<ChildSpec, String> {
         match kind {
             PeerKind::Ws { url } => {
-                check_url(url, self.inner.opts.insecure_ws).map_err(|(_, why)| why)?;
+                check_url(url, self.insecure_ws()).map_err(|(_, why)| why)?;
                 Ok(ChildSpec::Ws { name: name.into(), url: url.clone() })
             }
             PeerKind::Dendrite { dir, via } => {
@@ -772,7 +907,7 @@ impl DynActivation {
                     let paths: Vec<String> = via.iter().map(|t| format!("{}=dyn.peer.{t}", t.rsplit('.').next().unwrap_or(t))).collect();
                     argv.extend(["--via-host".into(), paths.join(",")]);
                 }
-                let argv = self.inner.opts.contain.wrap(Path::new(dir), &self.denied(), argv)?;
+                let argv = self.containment().wrap(Path::new(dir), &self.denied(), argv)?;
                 Ok(ChildSpec::Stdio { name: name.into(), argv })
             }
         }
@@ -806,16 +941,27 @@ impl DynActivation {
             Ok(child) => self.vet(name, &child, expecting.as_deref()).map(|_| child),
             Err(e) => Err(e.to_string()),
         };
+        let repin_on_valid_cert = self.config().get(&settings::DYN_REPIN_ON_VALID_CERT);
         let mut peers = self.inner.peers.lock().unwrap();
         let Some(e) = peers.get_mut(name) else { return Err(format!("`{name}` was disconnected while it was mounted")) };
         match mounted {
             Ok(child) => {
                 let proved = child.identity().map(PeerIdentity::from);
                 match (&e.pin, &proved) {
+                    // NEST-21: a renewed certificate (its key moved, the
+                    // peer's backend and own key the same, the chain
+                    // validated as every dial's is) re-pinned by the setting.
+                    (Some(pinned), Some(p)) if pinned != p && repin_on_valid_cert && pinned.only_tls_moved(p) => {
+                        tracing::warn!(target: "plexus::audit", peer = %name, old = %pinned.fingerprint(), new = %p.fingerprint(), "dyn re-pinned on a valid certificate (dyn.repin_on_valid_cert)");
+                        e.pin = proved.clone();
+                        e.presented = None;
+                    }
                     (Some(pinned), Some(p)) if pinned != p => {
                         let why = identity_changed(name, pinned, p);
                         tracing::error!(target: "plexus::dyn", peer = %name, %pinned, proved = %p, "refused: another identity");
                         e.why = Some(why.clone());
+                        // NEST-21: kept for `dyn.repin`.
+                        e.presented = Some(p.clone());
                         return Err(why);
                     }
                     (None, _) => e.pin = proved,
@@ -909,7 +1055,7 @@ impl DynActivation {
                 // what is consented for it.
                 self.register(&name, child.peer_key());
                 self.hold(&name, &child);
-                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin });
+                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin, presented: None });
                 if let Err(message) = self.surface(&name, &child) {
                     self.inner.peers.lock().unwrap().remove(&name);
                     return DynEvent::Error { message };
@@ -918,6 +1064,60 @@ impl DynActivation {
             }
             Err(e) => DynEvent::Error { message: e.to_string() },
         }
+    }
+
+    /// NEST-21: every peer's pin and the identity it presented and was
+    /// refused for, if any.
+    pub fn pin_list(&self) -> Vec<PinInfo> {
+        self.inner
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, e)| PinInfo {
+                name: name.clone(),
+                fingerprint: e.pin.as_ref().map(PeerIdentity::fingerprint),
+                pinned: e.pin.clone(),
+                presented_fingerprint: e.presented.as_ref().map(PeerIdentity::fingerprint),
+                presented: e.presented.clone(),
+            })
+            .collect()
+    }
+
+    /// NEST-21: pin `name` to the identity it presented — only when
+    /// `fingerprint` is that identity's ([`PeerIdentity::fingerprint`]), so
+    /// nobody accepts blind — and mount it now.
+    pub async fn repin_peer(&self, name: &str, fingerprint: &str) -> DynEvent {
+        let (old, pinned) = {
+            let mut peers = self.inner.peers.lock().unwrap();
+            let Some(e) = peers.get_mut(name) else { return DynEvent::Error { message: format!("no peer `{name}`") } };
+            let Some(presented) = e.presented.clone() else {
+                return DynEvent::Refused { reason: Refusal::NotPresented, message: format!("`{name}` presented no other identity: nothing to re-pin"), old: e.pin.clone(), presented: None };
+            };
+            if presented.fingerprint() != fingerprint.trim() {
+                return DynEvent::Refused {
+                    reason: Refusal::FingerprintMismatch,
+                    message: format!("`{fingerprint}` is not what `{name}` presented: compare `dyn.pins`' presented_fingerprint with the peer's own"),
+                    old: e.pin.clone(),
+                    presented: Some(presented),
+                };
+            }
+            let old = e.pin.replace(presented.clone());
+            e.presented = None;
+            e.why = Some("re-pinned; mounting".into());
+            (old, presented)
+        };
+        // DYNAUTH-5: another key is another client — its consent goes.
+        self.register(name, pinned.key.as_deref());
+        tracing::warn!(target: "plexus::audit", peer = %name, actor = %plexus_core::plexus::config::current_actor().join(" < "), old = %old.as_ref().map(PeerIdentity::fingerprint).unwrap_or_default(), new = %pinned.fingerprint(), "dyn repin");
+        let up = match self.mount(name, true).await {
+            Ok(_) => true,
+            Err(why) => {
+                tracing::warn!(target: "plexus::dyn", peer = %name, "re-pinned, not mounted yet: {why}");
+                false
+            }
+        };
+        DynEvent::Repinned { name: name.to_string(), old, fingerprint: pinned.fingerprint(), pinned, up }
     }
 
     /// The peers, listed.
@@ -952,6 +1152,7 @@ impl DynActivation {
                     identity: e.pin.clone(),
                     insecure: matches!(&e.kind, PeerKind::Ws { url } if check_url(url, false).is_err()),
                     revoked: revoked.get(name).cloned(),
+                    presented: e.presented.clone(),
                 }
             })
             .collect()
@@ -979,7 +1180,14 @@ impl DynActivation {
         // DYNAUTH-12: the signing key, wherever it is kept.
         out.extend(o.key_file.iter().cloned());
         out.extend(o.contain.deny.iter().cloned());
+        // NEST-21: `dyn.containment.deny` adds, never takes away.
+        out.extend(self.config().get(&settings::DYN_CONTAINMENT_DENY).into_iter().map(PathBuf::from));
         out
+    }
+
+    /// NEST-21: the options' containment, `dyn.containment.require` read now.
+    fn containment(&self) -> Containment {
+        Containment { require: self.config().get(&settings::DYN_CONTAINMENT_REQUIRE), ..self.inner.opts.contain.clone() }
     }
 
     fn data_dir_for(&self, name: &str) -> PathBuf {
@@ -1085,7 +1293,7 @@ pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
 
 /// Runtime peers: connect services, grow dendrites, call them as
 /// `dyn.peer.<name>.<path>.<method>`.
-#[plexus_macros::activation(roles(viewer = ["peers", "names", "consents"]))]
+#[plexus_macros::activation(roles(viewer = ["peers", "names", "consents", "pins"]))]
 impl DynActivation {
     /// Connect the service at `url` (a WebSocket) as the peer `name`; a taken
     /// name is refused unless `replace`. `wss://` anywhere, `ws://` only to
@@ -1095,8 +1303,8 @@ impl DynActivation {
     /// `expecting` (NEST-16): an interface hash, a contract's stamp — the
     /// peer must serve exactly that interface, now and at every remount.
     pub async fn connect(&self, name: String, url: String, replace: Option<bool>, expecting: Option<String>) -> DynEvent {
-        if let Err((reason, message)) = check_url(&url, self.inner.opts.insecure_ws) {
-            return DynEvent::Refused { reason, message };
+        if let Err((reason, message)) = check_url(&url, self.insecure_ws()) {
+            return DynEvent::Refused { reason, message, old: None, presented: None };
         }
         self.add(name, PeerKind::Ws { url }, replace.unwrap_or(false), expecting).await
     }
@@ -1206,6 +1414,23 @@ impl DynActivation {
     #[plexus_macros::method(public)]
     pub async fn jwks(&self) -> Jwks {
         self.inner.issuer.jwks()
+    }
+
+    /// NEST-21: every peer's pin — the identity pinned and its fingerprint,
+    /// and the identity it last presented and was refused for, with the
+    /// fingerprint `dyn.repin` takes.
+    #[plexus_macros::method]
+    pub async fn pins(&self) -> impl Stream<Item = PinInfo> + Send + 'static {
+        futures::stream::iter(self.pin_list())
+    }
+
+    /// NEST-21: pin `name` to the identity it presented and was refused for
+    /// (`identity_changed`) — only when `fingerprint` is exactly that
+    /// identity's (`dyn.pins`' `presented_fingerprint`, checked against the
+    /// peer's own word), so nobody re-pins blind — and mount it again.
+    #[plexus_macros::method]
+    pub async fn repin(&self, name: String, fingerprint: String) -> DynEvent {
+        self.repin_peer(&name, &fingerprint).await
     }
 
     /// Every peer: its kind, whether it is up, its interface's hash, its

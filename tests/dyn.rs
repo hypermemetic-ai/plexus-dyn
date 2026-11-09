@@ -25,6 +25,10 @@
 //!   allowed and said (`insecure`); a `wss://` peer's certificate validated
 //!   and its key pinned — a restart with another key refused
 //!   (`identity_changed`) until it is connected again with `replace`.
+//! - NEST-21: a setting flipped through `config` takes effect at the next
+//!   connect, shows in `config.list`, reverts unconfirmed, is refused for a
+//!   viewer and audited; `dyn.repin` takes only the presented fingerprint;
+//!   `dyn.repin_on_valid_cert` follows a renewed certificate.
 //! - DYNAUTH-9: a grown dendrite is contained — it cannot read a key file,
 //!   another dendrite's directory or `~/.plexus`, nor see the host's
 //!   environment; it reads and writes its own directory. Without its
@@ -189,7 +193,8 @@ async fn rig_opts(peers_file: Option<PathBuf>, tweak: impl FnOnce(&mut DynOption
     }
     // DYNAUTH-5: the roles, plus what consent gives a role.
     let gate = Arc::new(Gate::new(members, dyn_.consent_roles(Arc::new(roles)), Arc::new(Everywhere)));
-    let host = Arc::new(DynamicHub::new("host").register(dyn_.clone()).with_gate(gate));
+    // NEST-21: the service's configuration served, as `config` (admin's).
+    let host = Arc::new(DynamicHub::new("host").register(dyn_.clone()).with_config_service().with_gate(gate));
     dyn_.start(&host).await.unwrap();
     Rig { host, dyn_, _data: data }
 }
@@ -958,11 +963,11 @@ async fn a_peer_grows_the_top_level() {
     let far = far(port, false).await;
     let r = rig_opts(None, |o| o.top_level = true).await;
     let top = |r: &Rig| -> Vec<String> { r.host.root().names() };
-    assert_eq!(top(&r), ["dyn"]);
+    assert_eq!(top(&r), ["config", "dyn"], "NEST-21: the rig serves `config` too");
     let url = format!("ws://127.0.0.1:{port}");
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await;
     assert_eq!(got[0]["type"], "connected", "{got:?}");
-    assert_eq!(top(&r), ["dyn", "w"]);
+    assert_eq!(top(&r), ["config", "dyn", "w"]);
     // At the top level: `w.weather.forecast`, on its own grant.
     let days = call(&r, TOP, "w.weather.forecast", json!({ "city": "lisbon" })).await;
     assert_eq!(days.len(), 7, "{days:?}");
@@ -974,14 +979,14 @@ async fn a_peer_grows_the_top_level() {
     // The host's schema lists it.
     let schema = call(&r, ADMIN, "host.schema", json!({})).await;
     let kids: Vec<&str> = schema[0]["children"].as_array().unwrap().iter().map(|c| c["namespace"].as_str().unwrap()).collect();
-    assert_eq!(kids, ["dyn", "w"], "{schema:?}");
+    assert_eq!(kids, ["config", "dyn", "w"], "{schema:?}");
     // A name the service serves already is refused.
     let taken = call(&r, ADMIN, "dyn.connect", json!({ "name": "dyn", "url": url })).await;
     assert!(taken[0]["message"].as_str().is_some_and(|m| m.contains("top level")), "{taken:?}");
     assert_eq!(call(&r, VIEWER, "dyn.names", json!({})).await, [json!("w")]);
     // Disconnected: gone from the top level.
     call(&r, ADMIN, "dyn.disconnect", json!({ "name": "w" })).await;
-    assert_eq!(top(&r), ["dyn"]);
+    assert_eq!(top(&r), ["config", "dyn"]);
     let gone = call(&r, ADMIN, "w.weather.forecast", json!({ "city": "lisbon" })).await;
     assert!(gone[0]["route_error"].as_str().is_some_and(|e| e.contains("w")), "{gone:?}");
     // The far side restarts: the top-level entry is the fresh mount.
@@ -1215,6 +1220,188 @@ async fn a_wss_peer_is_validated_and_its_key_pinned() {
     let _ = second.stop();
 }
 
+// ------------------------------------------------------------------ NEST-21
+
+/// This machine's address beyond loopback, if it has one (the one a route
+/// out would leave from; nothing is sent).
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("10.255.255.255:9").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+/// The far service on every address, `port`.
+async fn far_anywhere(port: u16) -> jsonrpsee::server::ServerHandle {
+    let module = DynamicHub::arc_into_rpc_module(Arc::new(DynamicHub::new("far").register(WeatherActivation))).unwrap();
+    let server = jsonrpsee::server::Server::builder().build(format!("0.0.0.0:{port}")).await.unwrap();
+    server.start(module)
+}
+
+fn audit_log() -> String {
+    String::from_utf8_lossy(&AUDIT_LOG.lock().unwrap()).to_string()
+}
+
+/// `transport.insecure_ws` flipped through `config` takes effect at the
+/// next connect: refused, then admitted; it shows in `config.list`, is
+/// refused for a viewer, reverts when unconfirmed, and is in the audit log.
+async fn a_setting_flipped_through_config_takes_effect_live() {
+    let port = free_port();
+    let far = far_anywhere(port).await;
+    let r = rig().await;
+    // An address beyond loopback: this machine's own, else one that is not
+    // there (then admitted means dialed, not refused).
+    let (url, reachable) = match lan_ip() {
+        Some(ip) => (format!("ws://{ip}:{port}"), true),
+        None => ("ws://example.invalid:1".to_string(), false),
+    };
+    let refused = call(&r, ADMIN, "dyn.connect", json!({ "name": "lan", "url": url })).await;
+    assert_eq!(refused[0]["reason"], "insecure_transport", "{refused:?}");
+    // A viewer may not, and an admin only as a confirmed commit.
+    let got = call(&r, VIEWER, "config.transport.insecure_ws.set", json!({ "value": true, "confirm_within": "5s" })).await;
+    assert!(got[0]["route_error"].as_str().is_some_and(|e| e.contains("config.{key}.{key}")), "{got:?}");
+    let got = call(&r, ADMIN, "config.transport.insecure_ws.set", json!({ "value": "true" })).await;
+    assert_eq!(got[0]["reason"], "confirm_required", "{got:?}");
+    let got = call(&r, ADMIN, "config.transport.insecure_ws.set", json!({ "value": "true", "confirm_within": "1500ms" })).await;
+    assert_eq!((got[0]["type"].as_str(), got[0]["setting"]["value"].as_bool()), (Some("set"), Some(true)), "{got:?}");
+    let listed = call(&r, ADMIN, "config.list", json!({})).await;
+    let k = listed.iter().find(|k| k["key"] == "transport.insecure_ws").expect("listed");
+    assert_eq!((k["value"].as_bool(), k["source"].as_str()), (Some(true), Some("runtime")), "{k}");
+    assert!(k["confirm_until"].is_number(), "{k}");
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "lan", "url": url })).await;
+    println!("measure: transport.insecure_ws flipped live; {url} reachable here: {reachable}");
+    if reachable {
+        assert_eq!(got[0]["type"], "connected", "admitted: {got:?}");
+        assert!(peer(&r, "lan").insecure, "said");
+        assert_eq!(call(&r, USER, "dyn.peer.lan.weather.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    } else {
+        assert_ne!(got[0]["reason"], "insecure_transport", "dialed, not refused: {got:?}");
+    }
+    // Not confirmed: reverted, and refused again.
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let k = call(&r, ADMIN, "config.transport.insecure_ws.get", json!({})).await;
+    assert_eq!((k[0]["value"].as_bool(), k[0]["source"].as_str()), (Some(false), Some("default")), "{k:?}");
+    let again = call(&r, ADMIN, "dyn.connect", json!({ "name": "lan2", "url": url })).await;
+    assert_eq!(again[0]["reason"], "insecure_transport", "{again:?}");
+    // Confirmed: kept.
+    call(&r, ADMIN, "config.transport.insecure_ws.set", json!({ "value": true, "confirm_within": "1s" })).await;
+    assert_eq!(call(&r, ADMIN, "config.transport.insecure_ws.confirm", json!({})).await[0]["type"], "confirmed");
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert_ne!(call(&r, ADMIN, "dyn.connect", json!({ "name": "lan3", "url": url })).await[0]["reason"], "insecure_transport");
+    // Audited: set, reverted, confirmed — the actor and hashes, never a value.
+    let log = audit_log();
+    for action in ["Set", "Reverted", "Confirmed", "Refused"] {
+        assert!(log.lines().any(|l| l.contains("config") && l.contains("transport.insecure_ws") && l.contains(&format!("action={action}"))), "{action} in the audit log:\n{log}");
+    }
+    assert!(log.lines().any(|l| l.contains("transport.insecure_ws") && l.contains(ADMIN)), "the actor");
+    stop(far).await;
+}
+
+/// `dyn.require_consent`, `dyn.containment.*` and the `child.*` settings
+/// are on the same configuration; what the options said is their flag layer.
+async fn dyn_settings_are_on_the_service_configuration() {
+    let r = rig_opts(None, |o| {
+        o.require_consent = false;
+        o.child.max_calls = 7;
+    })
+    .await;
+    let c = r.host.config();
+    assert!(r.dyn_.config().same(&c), "dyn reads the service's");
+    let listed = call(&r, ADMIN, "config.list", json!({})).await;
+    let by = |k: &str| listed.iter().find(|i| i["key"] == k).cloned().unwrap_or_else(|| panic!("{k} not listed: {listed:?}"));
+    assert_eq!((by("dyn.require_consent")["value"].as_bool(), by("dyn.require_consent")["source"].as_str()), (Some(false), Some("flag")));
+    assert_eq!(by("child.max_calls")["value"], 7);
+    for k in ["dyn.repin_on_valid_cert", "dyn.containment.deny", "dyn.containment.require", "transport.tls_roots", "child.legacy_upcalls", "child.timeout", "child.backoff", "log.redact.keys"] {
+        let _ = by(k);
+    }
+    assert_eq!(by("dyn.repin_on_valid_cert")["value"], false, "D33: refusing is the default");
+    // remote = false over the wire.
+    let got = call(&r, ADMIN, "config.transport.tls_roots.set", json!({ "value": "/tmp/ca.pem" })).await;
+    assert_eq!(got[0]["reason"], "not_remote", "{got:?}");
+    // A reset comes back to the flag.
+    call(&r, ADMIN, "config.dyn.require_consent.set", json!({ "value": true, "confirm_within": "30s" })).await;
+    assert!(c.get(&plexus_dyn::settings::DYN_REQUIRE_CONSENT));
+    call(&r, ADMIN, "config.dyn.require_consent.reset", json!({})).await;
+    assert!(!c.get(&plexus_dyn::settings::DYN_REQUIRE_CONSENT), "the flag's again");
+}
+
+/// `dyn.repin` refuses a wrong fingerprint and takes the presented one;
+/// `dyn.pins` shows both.
+async fn repin_takes_only_the_presented_fingerprint() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let port = free_port();
+    let url = format!("ws://127.0.0.1:{port}");
+    let (one, two) = (PeerKey::generate(), PeerKey::generate());
+    let first = keyed_peer(port, keyed(&one)).await;
+    let r = rig().await;
+    assert_eq!(call(&r, ADMIN, "dyn.connect", json!({ "name": "k", "url": url })).await[0]["type"], "connected");
+    let pins = call(&r, VIEWER, "dyn.pins", json!({})).await;
+    let pinned_fp = pins[0]["fingerprint"].as_str().expect("pinned").to_string();
+    assert!(pinned_fp.starts_with("sha256:") && pins[0].get("presented").is_none(), "{pins:?}");
+    let nothing = call(&r, ADMIN, "dyn.repin", json!({ "name": "k", "fingerprint": pinned_fp })).await;
+    assert_eq!(nothing[0]["reason"], "not_presented", "{nothing:?}");
+    first.abort();
+    let _ = first.await;
+    let second = keyed_peer(port, keyed(&two)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let presented = loop {
+        let _ = call(&r, USER, "dyn.peer.k.forecast", json!({ "city": "oslo" })).await;
+        if let Some(p) = peer(&r, "k").presented {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "the new key was never presented: {:?}", peer(&r, "k"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert_eq!(presented.key.as_deref(), Some(two.kid()));
+    let pins = call(&r, VIEWER, "dyn.pins", json!({})).await;
+    let presented_fp = pins[0]["presented_fingerprint"].as_str().expect("presented").to_string();
+    assert_eq!(presented_fp, presented.fingerprint());
+    assert_eq!(pins[0]["fingerprint"], pinned_fp.as_str(), "still pinned to the first");
+    // A viewer may read the pins, not re-pin.
+    assert!(call(&r, VIEWER, "dyn.repin", json!({ "name": "k", "fingerprint": presented_fp })).await[0].get("route_error").is_some());
+    let wrong = call(&r, ADMIN, "dyn.repin", json!({ "name": "k", "fingerprint": pinned_fp })).await;
+    assert_eq!(wrong[0]["reason"], "fingerprint_mismatch", "{wrong:?}");
+    assert_eq!(wrong[0]["presented"]["key"], two.kid(), "the presented identity kept and said: {wrong:?}");
+    assert_eq!(wrong[0]["old"]["key"], one.kid(), "{wrong:?}");
+    let ok = call(&r, ADMIN, "dyn.repin", json!({ "name": "k", "fingerprint": presented_fp })).await;
+    assert_eq!((ok[0]["type"].as_str(), ok[0]["up"].as_bool()), (Some("repinned"), Some(true)), "{ok:?}");
+    assert_eq!(peer(&r, "k").identity.and_then(|i| i.key), Some(two.kid().to_string()));
+    assert_eq!(call(&r, USER, "dyn.peer.k.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    assert!(audit_log().lines().any(|l| l.contains("dyn repin") && l.contains(&presented_fp)), "audited");
+    second.abort();
+}
+
+/// `dyn.repin_on_valid_cert` (off by default, D33): on, a peer whose
+/// certificate key moved under a valid chain is re-pinned, not refused.
+async fn repin_on_valid_cert_follows_a_renewed_certificate() {
+    let pki = Pki::new();
+    let port = free_port();
+    let url = format!("wss://127.0.0.1:{port}");
+    let first = far_tls(port, pki.leaf("one")).await;
+    let r = rig_opts(None, |o| o.child.tls_roots = Some(pki.roots())).await;
+    assert_eq!(call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": url })).await[0]["type"], "connected");
+    let pinned = peer(&r, "w").identity.expect("pinned");
+    let got = call(&r, ADMIN, "config.dyn.repin_on_valid_cert.set", json!({ "value": true, "confirm_within": "60s" })).await;
+    assert_eq!(got[0]["type"], "set", "{got:?}");
+    assert_eq!(call(&r, ADMIN, "config.dyn.repin_on_valid_cert.confirm", json!({})).await[0]["type"], "confirmed");
+    let _ = first.stop();
+    first.stopped().await;
+    let second = far_tls(port, pki.leaf("two")).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = call(&r, USER, "dyn.peer.w.weather.forecast", json!({ "city": "oslo" })).await;
+        let p = peer(&r, "w");
+        if got.len() == 7 && p.identity.as_ref().is_some_and(|i| i.tls_key != pinned.tls_key) {
+            assert!(p.presented.is_none(), "{p:?}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "never re-pinned: {got:?} {p:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(audit_log().contains("re-pinned on a valid certificate"));
+    let _ = second.stop();
+}
+
 // ------------------------------------------------------------------ DYNAUTH-9
 
 const SECRET_ENV: &str = "PLEXUS_DYN_TEST_SECRET";
@@ -1370,7 +1557,11 @@ fn main() {
             an_onward_call_is_an_exchange,
             a_revoked_peer_is_refused_and_its_tokens_expire,
             every_hop_is_audited_without_a_secret,
-            the_signing_key_rotates
+            the_signing_key_rotates,
+            a_setting_flipped_through_config_takes_effect_live,
+            dyn_settings_are_on_the_service_configuration,
+            repin_takes_only_the_presented_fingerprint,
+            repin_on_valid_cert_follows_a_renewed_certificate
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });

@@ -42,7 +42,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let dyn_ = DynActivation::new(opts);
-    let service = Arc::new(DynamicHub::new("svc").register(dyn_.clone()));
+    // NEST-21: the service's configuration served as `config`.
+    let service = Arc::new(DynamicHub::new("svc").register(dyn_.clone()).with_config_service());
     dyn_.start(&service).await.map_err(|e| anyhow::anyhow!(e))?;
     for p in dyn_.list() {
         eprintln!("peer {}: {}", p.name, if p.up { "up".to_string() } else { format!("down ({})", p.why.unwrap_or_default()) });

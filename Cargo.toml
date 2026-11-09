@@ -32,6 +32,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 toml = "0.8"
+# NEST-21: a peer identity's fingerprint (sha256), as `dyn.repin` takes it.
+sha2 = "0.10"
 tracing = "0.1"
 
 # DYNAUTH-9: a grown dendrite runs under a Landlock ruleset (the launcher,
