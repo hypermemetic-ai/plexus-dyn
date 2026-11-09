@@ -12,8 +12,11 @@
 //! - **on Linux, takes a Landlock ruleset** before it executes the
 //!   dendrite: everything it may read is granted explicitly, and the
 //!   denied paths are carved out — `dyn`'s data directory (every other
-//!   dendrite's), `~/.plexus` (keys and sessions), `~/.ssh`, `~/.gnupg`,
-//!   `~/.password-store`, the host's own dial key, and each of
+//!   dendrite's), every secret store of the user's ([`SECRET_STORES`]:
+//!   `~/.plexus`, `~/.ssh`, `~/.gnupg`, `~/.password-store`, hyperforge's,
+//!   gh's, menger's, cargo's credentials, docker's, kube's, the cloud
+//!   CLIs', `~/.netrc`, `~/.npmrc`, `~/.pypirc`; [`RUNTIME_SECRETS`]:
+//!   synapse's holder socket), the host's own dial key, and each of
 //!   [`Containment::deny`]. It writes only inside its own directory (and
 //!   `/dev/null`). Where the kernel knows them (ABI 6, 9) it also may not
 //!   signal processes outside it, reach abstract UNIX sockets made outside
@@ -28,6 +31,42 @@
 //! stays the admin's and host-equivalent trust (TM-5).
 
 use std::path::{Path, PathBuf};
+
+/// DYNAUTH-9, DYNAUTH-22: the user's secret stores, under `$HOME`, that no
+/// dendrite may read — keys, sessions, tokens and credentials of every tool
+/// on the machine that keeps one in a file.
+pub const SECRET_STORES: &[&str] = &[
+    // DYNAUTH-9: Plexus keys and sessions, SSH, GnuPG, pass.
+    ".plexus",
+    ".ssh",
+    ".gnupg",
+    ".password-store",
+    // DYNAUTH-22: hyperforge (its secrets.yaml is plaintext), GitHub's CLI,
+    // menger's local key and data.
+    ".config/hyperforge",
+    ".config/gh",
+    ".config/menger",
+    ".local/share/menger",
+    // crates.io tokens.
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    // Container registries, Kubernetes, cloud CLIs.
+    ".docker/config.json",
+    ".kube",
+    ".aws",
+    ".config/gcloud",
+    // Passwords and registry tokens of the classic tools.
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+];
+
+/// DYNAUTH-22: under `$XDG_RUNTIME_DIR`: synapse's signed-in connection
+/// holder (`synapse/holder-*.sock`), which acts as whoever signed in. Its
+/// socket is also out of reach by Landlock's socket scope on Linux ≥ 7.1
+/// (DYNAUTH-9); denying the directory keeps it from being listed or read on
+/// older kernels too.
+pub const RUNTIME_SECRETS: &[&str] = &["synapse"];
 
 /// The launcher's name, beside the host's executable or on `PATH`.
 pub const LAUNCHER: &str = "plexus-dyn-contain";
@@ -72,14 +111,27 @@ impl Containment {
     }
 
     /// The paths denied by default to a dendrite of a host whose data
-    /// directory is `data_dir`: that, and the user's key directories.
+    /// directory is `data_dir`: that, and every secret store of the user's
+    /// that is there now ([`Containment::default_deny_in`], `$HOME` and
+    /// `$XDG_RUNTIME_DIR`).
     pub fn default_deny(data_dir: &Path) -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        Self::default_deny_in(data_dir, home.as_deref(), runtime.as_deref())
+    }
+
+    /// [`Containment::default_deny`] for a given home and runtime directory:
+    /// `data_dir`, then each of [`SECRET_STORES`] under `home` and
+    /// [`RUNTIME_SECRETS`] under `runtime` that exists (DYNAUTH-22: a path
+    /// that is not there is skipped, not an error; the list is read again at
+    /// every spawn, so a store made later is denied to the next dendrite).
+    pub fn default_deny_in(data_dir: &Path, home: Option<&Path>, runtime: Option<&Path>) -> Vec<PathBuf> {
         let mut out = vec![data_dir.to_path_buf()];
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            for d in [".plexus", ".ssh", ".gnupg", ".password-store"] {
-                out.push(home.join(d));
-            }
-        }
+        let under = |base: Option<&Path>, names: &[&str]| -> Vec<PathBuf> {
+            base.map(|b| names.iter().map(|n| b.join(n)).filter(|p| p.symlink_metadata().is_ok()).collect()).unwrap_or_default()
+        };
+        out.extend(under(home, SECRET_STORES));
+        out.extend(under(runtime, RUNTIME_SECRETS));
         out
     }
 
@@ -379,5 +431,41 @@ mod tests {
     fn mountinfo_paths_are_unescaped() {
         assert_eq!(unescape(r"/a\040b/c\134d"), PathBuf::from("/a b/c\\d"));
         assert_eq!(unescape("/plain"), PathBuf::from("/plain"));
+    }
+}
+
+#[cfg(test)]
+mod deny_tests {
+    use super::*;
+
+    /// DYNAUTH-22: every secret store there is denied; one not there is skipped.
+    #[test]
+    fn every_present_secret_store_is_denied_and_an_absent_one_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let data = home.path().join("data");
+        let present = [".config/hyperforge", ".config/gh", ".cargo/credentials.toml", ".docker/config.json", ".netrc", ".aws"];
+        for p in present {
+            let path = home.path().join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "secret").unwrap();
+        }
+        std::fs::create_dir_all(run.path().join("synapse")).unwrap();
+        let got = Containment::default_deny_in(&data, Some(home.path()), Some(run.path()));
+        assert_eq!(got[0], data, "the data directory first, whether or not it exists");
+        for p in present {
+            assert!(got.contains(&home.path().join(p)), "{p} denied: {got:?}");
+        }
+        assert!(got.contains(&run.path().join("synapse")), "{got:?}");
+        // Not there: skipped (no `.kube`, no `.npmrc`, no `.plexus`).
+        for absent in [".kube", ".npmrc", ".plexus", ".config/gcloud"] {
+            assert!(!got.contains(&home.path().join(absent)), "{absent} skipped: {got:?}");
+        }
+        assert_eq!(got.len(), 1 + present.len() + 1, "{got:?}");
+        // The whole list is the ticket's.
+        for p in [".config/menger", ".local/share/menger", ".cargo/credentials", ".kube", ".config/gcloud", ".npmrc", ".pypirc"] {
+            assert!(SECRET_STORES.contains(&p), "{p}");
+        }
+        assert_eq!(Containment::default_deny_in(&data, None, None), vec![data.clone()]);
     }
 }

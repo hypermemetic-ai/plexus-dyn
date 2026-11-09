@@ -95,8 +95,12 @@ crate's binary, found beside the service's executable or on `PATH`; or
 - starts it in its own directory;
 - on Linux, restricts it with **Landlock** before it executes: it reads
   everything but `dyn`'s data directory (every other dendrite's),
-  `~/.plexus`, `~/.ssh`, `~/.gnupg`, `~/.password-store`, the dial key
-  (`child.key`) and each path of `contain.deny` (the host's signing key, a
+  every secret store of the user's that is there (`~/.plexus`, `~/.ssh`,
+  `~/.gnupg`, `~/.password-store`, `~/.config/hyperforge`, `~/.config/gh`,
+  `~/.config/menger`, `~/.local/share/menger`, `~/.cargo/credentials{,.toml}`,
+  `~/.docker/config.json`, `~/.kube`, `~/.aws`, `~/.config/gcloud`,
+  `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `$XDG_RUNTIME_DIR/synapse`; one
+  not there is skipped), the dial key (`child.key`) and each path of `contain.deny` (the host's signing key, a
   bridge's sealed store) — wherever those are also mounted (a bind mount,
   a btrfs subvolume); it writes only its own directory (and `/dev/null`);
   on kernels that have them, it may not signal a process outside it, reach
