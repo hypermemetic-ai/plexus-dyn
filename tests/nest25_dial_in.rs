@@ -88,6 +88,15 @@ impl Restock {
             Err(e) => json!({ "error": e.to_string() }),
         }
     }
+    /// KEEL-51: the parent's items, called back after `ms` milliseconds.
+    #[plexus_macros::method]
+    pub async fn later(&self, parent: Parent<shop::ShopClient>, ms: u64) -> Value {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        match parent.items().await {
+            Ok(v) => json!({ "low": v }),
+            Err(e) => json!({ "error": e.to_string() }),
+        }
+    }
 }
 
 /// A graft whose parent this host does not serve.
@@ -727,11 +736,16 @@ async fn a_dial_in_peers_calls_back_keep_the_rules_of_a_dialed_peers() {
     assert_eq!(dialed_in[0], ("admin sneak".to_string(), false));
     assert_eq!(dialed_in[1], ("viewer low".to_string(), false));
     assert_eq!(dialed_in[3], ("admin low".to_string(), true));
-    // KEEL-51 (a session ceiling dropped on every peer's call back, dialed
-    // ones too, plexus-core): today a session ceilinged to viewer reaches
-    // `shop.items` through the call back. This asserts the bug as it stands,
-    // so it fails the day KEEL-51 lands — then flip it to `false`.
-    assert_eq!(dialed_in[2], ("admin ceilinged to viewer low".to_string(), true), "KEEL-51 landed? flip this row to false");
+    assert_eq!(dialed_in[2], ("admin ceilinged to viewer low".to_string(), false), "the session's ceiling holds on the call back");
+    // A sign-in that ends while the call is open (AUTH-11) ends its call
+    // back: admitted at the call, refused after its `expires_at`.
+    for peer in ["alice", "far"] {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let ending = AuthContext::for_principal(&ADMIN.parse().unwrap(), "ending", vec![], json!({ plexus_auth_core::auth::EXPIRES_AT_KEY: now + 2 }));
+        let s = host.service.route(&format!("dyn.peer.{peer}.later"), json!({ "ms": 3100 }), Some(&ending)).await.expect("admitted while it stands");
+        let said = format!("{:?}", s.collect::<Vec<PlexusStreamItem>>().await);
+        assert!(!said.contains("flour") && said.contains("unauthenticated"), "{peer}: the call back ran on a sign-in that had ended: {said}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

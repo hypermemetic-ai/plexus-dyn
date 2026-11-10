@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+KEEL-51: tests only (the fix is plexus-core's, its next release after
+0.11.2). `keel51_a_capped_session_is_refused_through_a_dialed_peers_call_back`
+— an admin capped to `viewer@*`, refused `dyn.peer.v.forecast` itself, is
+refused it too through a dialed peer whose need is consented and whose
+callers are the viewers; `keel51_an_in_process_peer_is_handed_the_sessions_ceiling`
+— an in-process peer is handed the caller's ceiling, so its own call as that
+caller is refused as the caller's is. NEST-25's
+`a_dial_in_peers_calls_back_keep_the_rules_of_a_dialed_peers` now asserts the
+capped admin refused through a dial-in peer's call back (it pinned the bug),
+and a call back made after the sign-in's `expires_at` refused, for a dial-in
+and a dialed peer (`Restock::later`). All red against plexus-core 0.11.2.
+
 ## [0.4.0] — unreleased
 
 NEST-25: **a node that dials in.** A service with no listening port opens a
