@@ -372,9 +372,14 @@ async fn a_name_held_by_another_key_is_refused_and_the_same_key_takes_it_over() 
     let (kb, _bob) = key(dir.path(), "bob", 6);
     let host = host().await;
     admit(&host, json!({ "name": "alice", "key": alice })).await;
+    // Admitted for alice's key, not connected yet: bob asking for it is refused, never pending.
+    let b = node(&host, "alice", &kb);
+    let refused = b.mounted(Duration::from_secs(10)).await.unwrap_err();
+    assert!(refused.contains("name_taken"), "{refused}");
+    assert!(host.dyn_.pending_list().is_empty());
     let a = node(&host, "alice", &k);
     a.mounted(Duration::from_secs(10)).await.unwrap();
-    // Bob asks for alice's name: refused before anything is asked of him.
+    // Bob asks for alice's name while she is connected: refused before anything is asked of him.
     let b = node(&host, "alice", &kb);
     let refused = b.mounted(Duration::from_secs(10)).await.unwrap_err();
     assert!(refused.contains("name_taken"), "{refused}");
@@ -450,18 +455,19 @@ async fn a_refused_key_stays_refused() {
     assert!(listed(&host).is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pending_is_capped_in_all_per_address_per_key_and_in_age() {
+/// Two offers wait; a third is refused `pending_full` — by the cap in all
+/// (`max`), or the cap from one address (`per_address`).
+async fn capped(seed: u8, max: usize, per_address: usize) {
     let dir = tempfile::tempdir().unwrap();
     let host = host_with(|o| {
-        o.dial_in_pending_max = 3;
-        o.dial_in_pending_per_address = 2;
+        o.dial_in_pending_max = max;
+        o.dial_in_pending_per_address = per_address;
         o.dial_in_pending_age = Duration::from_millis(1500);
     })
     .await;
-    let (k1, _) = key(dir.path(), "n1", 11);
-    let (k2, _) = key(dir.path(), "n2", 12);
-    let (k3, _) = key(dir.path(), "n3", 13);
+    let (k1, _) = key(dir.path(), "n1", seed);
+    let (k2, _) = key(dir.path(), "n2", seed + 1);
+    let (k3, _) = key(dir.path(), "n3", seed + 2);
     let n1 = node(&host, "n1", &k1);
     until("n1 pending", || n1.pending().is_some()).await;
     // One per key: the same key again supersedes the first.
@@ -471,16 +477,25 @@ async fn pending_is_capped_in_all_per_address_per_key_and_in_age() {
     until("n1b pending", || n1b.pending().is_some()).await;
     let n2 = node(&host, "n2", &k2);
     until("n2 pending", || n2.pending().is_some()).await;
-    // Two from 127.0.0.1 already: a third from there is refused.
     let n3 = node(&host, "n3", &k3);
     let full = n3.mounted(Duration::from_secs(5)).await.unwrap_err();
-    assert!(full.contains("pending_full"), "{full}");
+    assert!(full.contains("pending_full"), "max {max}, per address {per_address}: {full}");
     assert_eq!(host.dyn_.pending_list().len(), 2);
     // And each waits its age, no longer.
     let expired = n2.mounted(Duration::from_secs(5)).await.unwrap_err();
     assert!(expired.contains("pending_expired"), "{expired}");
     until("none pending", || host.dyn_.pending_list().is_empty()).await;
     assert!(listed(&host).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_is_capped_in_all_per_key_and_in_age() {
+    capped(11, 2, 100).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_is_capped_per_address() {
+    capped(31, 100, 2).await;
 }
 
 // ------------------------------------------------------------------ row 3
