@@ -140,7 +140,9 @@ rule (declared is enough). A consent names only needs the peer declares; a
 `method@scope` need is reached only on that scope. `callers` are roles: a
 service that hands its gate `dyn.consent_roles(roles)` lets a holder of a
 named role call every method of the peer (`dyn.peer.<name>.…`, and
-`<name>.…` at the top level). Consent is kept in `<data-dir>/consent.json`
+`<name>.…` at the top level) — except one its schema marks `everywhere`
+(KEEL-31): a whole-service method is never consent's to give, and stays
+with whoever holds its grant on `*` by their own role. Consent is kept in `<data-dir>/consent.json`
 (0600) with the key it was given for; another key is another client, and
 its consent is dropped. Every change moves the gate's grants generation.
 
