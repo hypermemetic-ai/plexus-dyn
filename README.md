@@ -304,6 +304,18 @@ over the name since is not touched). It is called as
    registration, as `connect … replace` is. `dyn.disconnect` lets it go and
    ends its open calls the same way.
 
+6. **Its consent is its holder's** (D2): a consent given for an in-process
+   peer holds only while the same attacher (`by`) serves the same `binding`
+   (the attacher's word for what the peer is: plexus-bridge passes its
+   binding hash). Another holder of the name — another binding, a keyless
+   WebSocket peer or dendrite with `replace`, or the reverse — is another
+   client and starts with no consent; `detach` drops it. A keyed peer's
+   consent is its key's, as before.
+7. **`holds(name, &peer)`**: whether dyn serves that very peer as `name`
+   and keeps no revocation for it. An attacher asks before it acts for the
+   peer outside a call (plexus-bridge: a sign-in, a key checked at an API,
+   a refresh), so a revoked or replaced peer acts for no one.
+
 It is not served at the service's top level (`top_level`).
 
 ## Onward calls (DYNAUTH-6)
