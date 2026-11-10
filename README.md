@@ -13,7 +13,7 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.names` | viewer | each peer's name — the slot's list |
 | `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
 | `dyn.jwks` | public | DYNAUTH-12: the JWK Set (Ed25519, `kid` = `key:<hex>`) a peer verifies this service's tokens with |
-| `dyn.exchange { subject_token, proof, audience, scope?, method? }` | public | DYNAUTH-6: RFC 8693 token exchange — a peer's token, with its proof of possession (method `exchange`, the token's `call`), for one addressed to the connected keyed peer `audience`, its scope never wider |
+| `dyn.exchange { subject_token, proof, audience, scope?, method? }` | public | DYNAUTH-6: RFC 8693 token exchange — a peer's token, with its proof of possession (method `exchange`, the token's `call`), for one addressed to the connected keyed peer `audience` and its `method`, its scope never wider. KEEL-19: only for a presenter mounted here, not revoked and consented to reach `dyn.peer.<audience>.<m>`; bound to the presenter's key; once per subject, audience and method |
 | `dyn.revoke { peer, why? }` | admin | DYNAUTH-7: nothing forwarded to it from now (no token minted), its calls back end, its consent goes; listed revoked until connected or grown again with `replace` |
 | `dyn.rotate_key` | admin | DYNAUTH-7: a new signing key from now; the old one in `dyn.jwks` for one token lifetime |
 | `dyn.consents` | viewer | each peer's key (proved at `_info`), declared needs, consented needs and callers, what is pending |
@@ -165,6 +165,17 @@ peer, the token minted for it is an exchange of the presented one: the
 original caller stays `sub`, `act` names each hop nearest first (`{sub:
 host, act: {sub: <presenter>, act: {sub: host}}}`), and its scope is never
 wider. `dyn.exchange` does the same as a method.
+
+KEEL-19: `dyn.exchange` is decided as a call back is — the presenter (the
+subject token's audience) must be mounted here, not revoked, and hold a
+consented need that covers the audience and the method asked
+(`dyn.peer.<audience>.<m>`); anything else is refused, its reason in
+brackets, and audited. The token it gives is bound to the presenter's key
+(`cnf`): the audience takes it only with the presenter's proof
+(`hop.proof`, by `prove(key, token, <method>, <hop.call>)`), over a
+connection proven as that key. A token the service forwards is taken only
+from the service's own connection. A subject token is exchanged once per
+audience and method.
 
 ## Revocation and audit (DYNAUTH-7)
 

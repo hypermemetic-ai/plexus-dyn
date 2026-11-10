@@ -617,14 +617,82 @@ impl DynActivation {
     }
 
     /// DYNAUTH-6: [`DynActivation::exchange`]'s work.
+    ///
+    /// KEEL-19: decided where a call back is decided. The presenter — the
+    /// subject token's audience, proven by its proof — must be a peer
+    /// mounted here, not revoked, holding a consented need that covers the
+    /// audience and the method asked (`dyn.peer.<audience>.<m>` for the
+    /// audience's `<backend>.<m>`, or `<audience>.<m>` when it is served at
+    /// the top level), held by the subject token: `RemoteChild::may_exchange`,
+    /// which asks the one function the presenter's calls back are asked by.
+    /// The token is bound to the presenter's key, so the audience takes it
+    /// only with the presenter's proof; a subject token is exchanged once
+    /// per audience and method. A refusal says its reason in brackets
+    /// (`[not_consented]`) and is audited.
     pub fn exchange_for(&self, subject: &str, proof: &str, audience: &str, scope: Option<&[String]>, method: &str) -> Result<(String, plexus_core::plexus::peer_token::PeerClaims), String> {
-        let child = self.inner.peers.lock().unwrap().get(audience).and_then(|e| e.child.clone());
-        let key = child.as_ref().and_then(|c| c.peer_key().map(str::to_string)).ok_or_else(|| format!("no connected peer `{audience}` that proved a key: a token is only exchanged for one"))?;
-        if let Some(why) = self.inner.store.lock().unwrap().revoked.get(audience) {
-            return Err(format!("`{audience}` is revoked ({why})"));
-        }
+        use plexus_core::plexus::peer_token::{narrow, ExchangeRefusal as R, Onward, PeerClaims, TokenError};
+        let reason = std::cell::Cell::new(None::<R>);
+        let decide = |presented: &PeerClaims| -> Result<Onward, (R, String)> {
+            let refuse = |r: R, why: String| {
+                reason.set(Some(r));
+                (r, why)
+            };
+            let (target, presenter) = {
+                let peers = self.inner.peers.lock().unwrap();
+                let target = peers.get(audience).and_then(|e| e.child.clone());
+                let presenter = peers.iter().find_map(|(n, e)| e.child.clone().filter(|c| c.peer_key() == Some(presented.aud.as_str())).map(|c| (n.clone(), c)));
+                (target, presenter)
+            };
+            let Some((target, key)) = target.and_then(|c| c.peer_key().map(str::to_string).map(|k| (c, k))) else {
+                return Err(refuse(R::Audience, format!("no connected peer `{audience}` that proved a key: a token is only exchanged for one")));
+            };
+            let Some((name, presenter)) = presenter else {
+                return Err(refuse(R::Presenter, "the token's holder is not a peer mounted in this service: only a mounted peer's token is exchanged".into()));
+            };
+            {
+                let store = self.inner.store.lock().unwrap();
+                for (who, n) in [("the presenter", name.as_str()), ("the audience", audience)] {
+                    if let Some(why) = store.revoked.get(n) {
+                        return Err(refuse(R::Revoked, format!("{who} `{n}` is revoked ({why})")));
+                    }
+                }
+            }
+            let backend = target.identity().map(|i| i.backend.clone()).unwrap_or_else(|| audience.to_string());
+            let Some(m) = method.strip_prefix(&format!("{backend}.")).filter(|m| !m.is_empty()) else {
+                return Err(refuse(R::NotConsented, format!("`{method}` is not a method of `{audience}`, whose methods are `{backend}.…`: an exchange names the method it is for")));
+            };
+            let mut needs = vec![format!("dyn.peer.{audience}.{m}")];
+            if self.inner.top.lock().unwrap().contains(audience) {
+                needs.push(format!("{audience}.{m}"));
+            }
+            let mut why = String::new();
+            for need in &needs {
+                match presenter.may_exchange(need, method, presented) {
+                    Ok(held) => {
+                        let scope = match scope {
+                            Some(asked) => narrow(Some(asked), &held),
+                            None => held,
+                        };
+                        if scope.is_empty() {
+                            return Err(refuse(R::NotConsented, format!("the scope asked is not within what `{name}` may reach of `{audience}`")));
+                        }
+                        return Ok(Onward { name: audience.to_string(), peer_key: Some(key), scope });
+                    }
+                    Err(w) => why = w,
+                }
+            }
+            let r = if presenter.revoked().is_some() { R::Revoked } else { R::NotConsented };
+            Err(refuse(r, format!("`{name}` may not reach `{}`: {why}", needs[0])))
+        };
         let call = uuid::Uuid::new_v4().to_string();
-        self.inner.issuer.exchange(subject, Some(proof), audience, Some(key), scope, &call, method, &self.inner.proofs).map_err(|e| format!("the exchange is refused: {e}"))
+        self.inner.issuer.exchange_decided(subject, Some(proof), audience, &call, method, &self.inner.proofs, decide).map_err(|e| {
+            let r = reason.get().unwrap_or(match &e {
+                TokenError::Proof(_) => R::Proof,
+                TokenError::Refused(_) => R::Again,
+                _ => R::Subject,
+            });
+            format!("the exchange is refused [{r}]: {e}")
+        })
     }
 
     /// DYNAUTH-5: the consent kept in the data directory, read at start.
@@ -1352,9 +1420,14 @@ impl DynActivation {
     /// service minted for a peer, presented by that peer with `proof` (its
     /// proof of possession for method `exchange` under the token's `call`),
     /// becomes a token for the connected peer `audience` (one that proved a
-    /// key): the same `sub`, the presenter added to `act`, `scope` the one
-    /// asked (all of the subject's when absent) narrowed to the subject's,
-    /// never wider. A token bound to no key (a pipe's) is not exchanged.
+    /// key) and `method` (the audience's, `<backend>.<m>`): the same `sub`,
+    /// the presenter added to `act`. KEEL-19: only for a presenter mounted
+    /// here, not revoked, consented to reach `dyn.peer.<audience>.<m>`; its
+    /// scope `method` where the subject holds that need and consent allows,
+    /// narrowed to `scope` when asked; bound to the presenter's key (the
+    /// audience takes it only with the presenter's proof); once per subject,
+    /// audience and method. A token bound to no key (a pipe's) is not
+    /// exchanged.
     #[plexus_macros::method(public)]
     pub async fn exchange(&self, subject_token: String, proof: String, audience: String, scope: Option<Vec<String>>, method: Option<String>) -> ExchangeEvent {
         match self.exchange_for(&subject_token, &proof, &audience, scope.as_deref(), method.as_deref().unwrap_or_default()) {

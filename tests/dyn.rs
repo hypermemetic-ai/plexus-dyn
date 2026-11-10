@@ -599,6 +599,26 @@ impl RelayActivation {
     pub async fn sneak(&self) -> Value {
         up("dyn", "grow", json!({ "name": "x", "source": "", "targets": [] })).await
     }
+    /// KEEL-19: this call's token and its claims (test only: a peer never
+    /// hands its token out) — what relay exchanges with `dyn.exchange`.
+    #[plexus_macros::method]
+    pub async fn mine(&self) -> Value {
+        own_token()
+    }
+}
+
+/// The token the call being served was forwarded with, and its claims.
+fn own_token() -> Value {
+    use base64::Engine as _;
+    let Ok(hop) = plexus_core::call::hop() else { return json!({ "no_hop": true }) };
+    let token = hop.token.clone().unwrap_or_default();
+    let claims: Value = token
+        .split('.')
+        .nth(1)
+        .and_then(|p| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(Value::Null);
+    json!({ "token": token, "claims": claims })
 }
 
 /// The first item of a call back, or the refusal.
@@ -625,23 +645,16 @@ impl TellActivation {
     /// This call's token (test only: a peer never echoes it) and its claims.
     #[plexus_macros::method]
     pub async fn claims(&self) -> Value {
-        use base64::Engine as _;
-        let Ok(hop) = plexus_core::call::hop() else { return json!({ "no_hop": true }) };
-        let token = hop.token.clone().unwrap_or_default();
-        let claims: Value = token
-            .split('.')
-            .nth(1)
-            .and_then(|p| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(p).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(Value::Null);
-        json!({ "token": token, "claims": claims })
+        own_token()
     }
 }
 
 /// DYNAUTH-6: a peer calling onward through its service gets the next peer
 /// a token by exchange (RFC 8693) — the same subject, the presenter in the
 /// actor chain, a scope never wider; `dyn.exchange` does the same as a
-/// method, with a proof, and refuses without one.
+/// method, with a proof, and refuses without one. KEEL-19: the method only
+/// for a presenter consented to reach the audience — here `relay`, whose
+/// need `dyn.peer.t.claims` is consented; `t` asking for `relay` is refused.
 async fn an_onward_call_is_an_exchange() {
     use plexus_core::plexus::peer_token::{prove, Expect, PeerKey, Verifier, EXCHANGE};
     let r = rig().await;
@@ -663,22 +676,32 @@ async fn an_onward_call_is_an_exchange() {
     assert_eq!(c["aud"], tk.kid());
     assert_eq!(c["act"], json!({ "sub": host, "act": { "sub": rk.kid(), "act": { "sub": host } } }), "act names each hop, nearest first: {got:?}");
     assert_eq!(c["scope"], "tell.claims@*", "only what reaching t needs, held by relay's token: {got:?}");
-    // The method: t's token, presented by t with its proof, exchanged for
-    // one addressed to relay — narrowed to what is asked, never wider.
+    // KEEL-19: t's token, presented by t with its proof, for relay: t holds
+    // no consented need that reaches relay — refused, saying so.
     let subject = direct["token"].as_str().unwrap().to_string();
     let subject_call = direct["claims"]["call"].as_str().unwrap().to_string();
-    let no_proof: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": "", "audience": "relay" }), None).await).await;
-    assert_eq!(no_proof[0]["type"], "error", "{no_proof:?}");
     let proof = prove(&tk, &subject, EXCHANGE, &subject_call);
-    let asked = json!({ "subject_token": subject, "proof": proof, "audience": "relay", "scope": ["tell.claims@*", "auth.grant@*"] });
+    let t_asks: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": proof, "audience": "relay", "method": "relay.ask" }), None).await).await;
+    assert!(t_asks[0]["message"].as_str().is_some_and(|m| m.contains("[not_consented]")), "{t_asks:?}");
+    // The method: relay's token (relay's own, as `mine` hands it over),
+    // presented by relay with its proof, exchanged for one addressed to t —
+    // narrowed to what is asked, never wider.
+    let mine = call(&r, USER, "dyn.peer.relay.mine", json!({})).await.remove(0);
+    let subject = mine["token"].as_str().unwrap().to_string();
+    let subject_call = mine["claims"]["call"].as_str().unwrap().to_string();
+    let no_proof: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": "", "audience": "t", "method": "tell.claims" }), None).await).await;
+    assert_eq!(no_proof[0]["type"], "error", "{no_proof:?}");
+    let proof = prove(&rk, &subject, EXCHANGE, &subject_call);
+    let asked = json!({ "subject_token": subject, "proof": proof, "audience": "t", "method": "tell.claims", "scope": ["tell.claims@*", "auth.grant@*"] });
     let ex: Vec<Value> = items(r.host.route("dyn.exchange", asked.clone(), None).await).await;
     assert_eq!(ex[0]["type"], "exchanged", "{ex:?}");
     assert_eq!(ex[0]["scope"], json!(["tell.claims@*"]), "never wider than the subject's: {ex:?}");
     assert_eq!(ex[0]["issued_token_type"], "urn:ietf:params:oauth:token-type:jwt");
-    let at_relay = Verifier::new(rk.kid(), &r.dyn_.jwk_set()).unwrap();
-    let claims = at_relay.verify(ex[0]["access_token"].as_str().unwrap(), &Expect::default()).unwrap();
+    let at_t = Verifier::new(tk.kid(), &r.dyn_.jwk_set()).unwrap();
+    let claims = at_t.verify(ex[0]["access_token"].as_str().unwrap(), &Expect::default()).unwrap();
     assert_eq!(claims.sub, USER);
-    assert_eq!(claims.actors(), [host.clone(), tk.kid().to_string(), host.clone()]);
+    assert_eq!(claims.actors(), [host.clone(), rk.kid().to_string(), host.clone()]);
+    assert_eq!(claims.cnf.map(|c| c.jkt), Some(rk.thumbprint()), "bound to its presenter, relay");
     // The same proof again: refused (a proof is used once).
     let again: Vec<Value> = items(r.host.route("dyn.exchange", asked, None).await).await;
     assert_eq!(again[0]["type"], "error", "{again:?}");
@@ -686,12 +709,180 @@ async fn an_onward_call_is_an_exchange() {
     let port = free_port();
     let far = far(port, false).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "w", "url": format!("ws://127.0.0.1:{port}") })).await;
-    let proof = prove(&tk, &subject, EXCHANGE, &subject_call);
-    let keyless: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": proof, "audience": "w" }), None).await).await;
+    let proof = prove(&rk, &subject, EXCHANGE, &subject_call);
+    let keyless: Vec<Value> = items(r.host.route("dyn.exchange", json!({ "subject_token": subject, "proof": proof, "audience": "w", "method": "weather.forecast" }), None).await).await;
     assert!(keyless[0]["message"].as_str().is_some_and(|m| m.contains("proved a key")), "{keyless:?}");
     stop(far).await;
     t.abort();
     relay.abort();
+}
+
+// ------------------------------------------------------------------ KEEL-19
+
+/// A peer `t` (TellActivation, `tk`'s key, verifying `dyn`'s tokens) served
+/// on one input proven as `proven`, trusting only `service` to act for
+/// others: the connection a presenter opens to it itself. One `tell.call`
+/// with `hop`; its first item.
+async fn direct_to_t(tk: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core::plexus::peer_token::Jwks, proven: &str, service: &str, hop: Value) -> Value {
+    use plexus_core::plexus::remote_child::{serve_child_with, ChildPeer, ServeChild};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let v = plexus_core::plexus::peer_token::Verifier::new(tk.kid(), jwks).unwrap();
+    let opts = ServeChild { peer: ChildPeer::connection(proven, [service.to_string()]), key: Some(tk.clone()), tokens: Some(Arc::new(v)) };
+    let (mut to_t, t_in) = tokio::io::duplex(1 << 16);
+    let (t_out, from_t) = tokio::io::duplex(1 << 16);
+    tokio::spawn(serve_child_with(TellActivation, t_in, t_out, opts));
+    let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "tell.call", "params": { "method": "tell.claims", "params": {}, "hop": hop } });
+    to_t.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+    let mut lines = tokio::io::BufReader::new(from_t).lines();
+    loop {
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await.expect("t answers").unwrap().unwrap();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v.get("method").and_then(Value::as_str) == Some("tell.call") {
+            return v["params"]["result"].clone();
+        }
+    }
+}
+
+/// The rig for KEEL-19: `t` (verifying) and `relay` (whose need
+/// `dyn.peer.t.claims` is consented only when `consent`), both keyed.
+struct Pair {
+    r: Rig,
+    tk: plexus_core::plexus::peer_token::PeerKey,
+    rk: plexus_core::plexus::peer_token::PeerKey,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+async fn pair(consent: bool) -> Pair {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let r = rig().await;
+    let (tk, rk) = (PeerKey::generate(), PeerKey::generate());
+    let (tp, rp) = (free_port(), free_port());
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
+    if consent {
+        let c = call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims"] })).await;
+        assert_eq!(c[0]["type"], "consented", "{c:?}");
+    }
+    Pair { r, tk, rk, tasks: vec![t, relay] }
+}
+
+impl Pair {
+    /// relay's token for a call the user made into it, and a fresh proof
+    /// for exchanging it.
+    async fn subject(&self) -> (String, String) {
+        use plexus_core::plexus::peer_token::{prove, EXCHANGE};
+        let mine = call(&self.r, USER, "dyn.peer.relay.mine", json!({})).await.remove(0);
+        let token = mine["token"].as_str().unwrap_or_else(|| panic!("{mine:?}")).to_string();
+        let proof = prove(&self.rk, &token, EXCHANGE, mine["claims"]["call"].as_str().unwrap());
+        (token, proof)
+    }
+
+    async fn exchange(&self, token: &str, proof: &str) -> Value {
+        let ask = json!({ "subject_token": token, "proof": proof, "audience": "t", "method": "tell.claims" });
+        items(self.r.host.route("dyn.exchange", ask, None).await).await.remove(0)
+    }
+
+    fn end(self) {
+        for t in self.tasks {
+            t.abort();
+        }
+    }
+}
+
+/// KEEL-19 (1), the reviewer's attack at its first step: relay, handed the
+/// user's token, asks `dyn.exchange` for one addressed to t — with a good
+/// proof, but no consent to reach t. Refused, typed, audited.
+async fn keel19_an_unconsented_peer_is_refused_an_exchange() {
+    let p = pair(false).await;
+    let (token, proof) = p.subject().await;
+    let got = p.exchange(&token, &proof).await;
+    assert_eq!(got["type"], "error", "the exchange must be refused: {got:?}");
+    assert!(got["message"].as_str().is_some_and(|m| m.contains("[not_consented]") && m.contains("dyn.peer.t.claims")), "{got:?}");
+    let log = String::from_utf8_lossy(&AUDIT_LOG.lock().unwrap()).to_string();
+    assert!(log.contains("peer token exchange refused") && log.contains("not_consented"), "audited: {log}");
+    for part in token.split('.').chain(proof.split('.')).filter(|x| x.len() > 8) {
+        assert!(!log.contains(part), "a log line holds a token's or a proof's bytes");
+    }
+    // Nor is a token of a peer not mounted here exchanged.
+    let stranger = plexus_core::plexus::peer_token::PeerKey::generate();
+    let theirs = p.r.dyn_.issuer().mint(plexus_core::plexus::peer_token::MintRequest { sub: USER.into(), peer_key: Some(stranger.kid().into()), name: "x".into(), scope: vec!["dyn.{peer}@*".into()], call: "c-x".into(), method: "x.y".into(), presented: None }).unwrap().0;
+    let proof = plexus_core::plexus::peer_token::prove(&stranger, &theirs, plexus_core::plexus::peer_token::EXCHANGE, "c-x");
+    let got = p.exchange(&theirs, &proof).await;
+    assert!(got["message"].as_str().is_some_and(|m| m.contains("[presenter]")), "{got:?}");
+    p.end();
+}
+
+/// KEEL-19, the legitimate onward hop: relay, consented to reach t,
+/// exchanges the user's token and calls t itself, with its proof, over a
+/// connection proven as relay: t runs it for the user. The same hop with no
+/// proof, or over a connection proven as another, is refused (2).
+async fn keel19_a_consented_peer_reaches_another_with_its_proof() {
+    use plexus_core::plexus::peer_token::{prove, PeerKey};
+    let p = pair(true).await;
+    let service = "key:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    let jwks = p.r.dyn_.jwk_set();
+    let hop = |token: &str, call: &str, proof: Option<String>| {
+        let mut h = json!({ "principal": p.rk.kid(), "for": [USER], "limit": { "grant": "tell.claims", "held_on": ["*"] }, "call": call, "token": token });
+        if let Some(pr) = proof {
+            h["proof"] = json!(pr);
+        }
+        h
+    };
+    let exchanged = || async {
+        let (token, proof) = p.subject().await;
+        let ex = p.exchange(&token, &proof).await;
+        assert_eq!(ex["type"], "exchanged", "{ex:?}");
+        let t = ex["access_token"].as_str().unwrap().to_string();
+        let call = plexus_core::plexus::peer_token::Verifier::new(p.tk.kid(), &jwks).unwrap().verify(&t, &Default::default()).unwrap().call;
+        (t, call)
+    };
+    let (t, c) = exchanged().await;
+    let got = direct_to_t(&p.tk, &jwks, p.rk.kid(), service, hop(&t, &c, Some(prove(&p.rk, &t, "tell.claims", &c)))).await;
+    assert_eq!(got["content"]["claims"]["sub"], USER, "t ran it for the user: {got:?}");
+    assert_eq!(got["content"]["claims"]["scope"], "tell.claims@*", "{got:?}");
+    // No proof: refused.
+    let (t, c) = exchanged().await;
+    let got = direct_to_t(&p.tk, &jwks, p.rk.kid(), service, hop(&t, &c, None)).await;
+    assert!(got["message"].as_str().is_some_and(|m| m.contains("no proof of possession")), "{got:?}");
+    // relay's proof, carried over another's connection: refused.
+    let other = PeerKey::generate();
+    let (t, c) = exchanged().await;
+    let mut h = hop(&t, &c, Some(prove(&p.rk, &t, "tell.claims", &c)));
+    h["principal"] = json!(other.kid());
+    let got = direct_to_t(&p.tk, &jwks, other.kid(), service, h).await;
+    assert!(got["message"].as_str().is_some_and(|m| m.contains("not as the presenter")), "{got:?}");
+    p.end();
+}
+
+/// KEEL-19 (3): a subject token is exchanged once per audience and method —
+/// a second ask, with a fresh proof, is refused.
+async fn keel19_a_subject_is_exchanged_once() {
+    use plexus_core::plexus::peer_token::{prove, EXCHANGE};
+    let p = pair(true).await;
+    let mine = call(&p.r, USER, "dyn.peer.relay.mine", json!({})).await.remove(0);
+    let token = mine["token"].as_str().unwrap().to_string();
+    let call_id = mine["claims"]["call"].as_str().unwrap().to_string();
+    let first = p.exchange(&token, &prove(&p.rk, &token, EXCHANGE, &call_id)).await;
+    assert_eq!(first["type"], "exchanged", "{first:?}");
+    let second = p.exchange(&token, &prove(&p.rk, &token, EXCHANGE, &call_id)).await;
+    assert!(second["message"].as_str().is_some_and(|m| m.contains("[again]") && m.contains("once")), "{second:?}");
+    p.end();
+}
+
+/// KEEL-19 (4): a revoked presenter's exchange is refused at once — with a
+/// subject token it was handed before, still live.
+async fn keel19_a_revoked_presenter_is_refused_at_once() {
+    let p = pair(true).await;
+    let (before, proof_before) = p.subject().await;
+    let (held, proof_held) = p.subject().await;
+    assert_eq!(p.exchange(&before, &proof_before).await["type"], "exchanged");
+    let revoked = call(&p.r, ADMIN, "dyn.revoke", json!({ "peer": "relay", "why": "compromised" })).await;
+    assert_eq!(revoked[0]["type"], "revoked", "{revoked:?}");
+    let got = p.exchange(&held, &proof_held).await;
+    assert!(got["message"].as_str().is_some_and(|m| m.contains("[revoked]") && m.contains("compromised")), "{got:?}");
+    p.end();
 }
 
 // ------------------------------------------------------------------ DYNAUTH-7
@@ -1555,6 +1746,10 @@ fn main() {
             a_verifying_peer_takes_a_call_by_its_token,
             a_keyed_peer_calls_back_with_its_proof,
             an_onward_call_is_an_exchange,
+            keel19_an_unconsented_peer_is_refused_an_exchange,
+            keel19_a_consented_peer_reaches_another_with_its_proof,
+            keel19_a_subject_is_exchanged_once,
+            keel19_a_revoked_presenter_is_refused_at_once,
             a_revoked_peer_is_refused_and_its_tokens_expire,
             every_hop_is_audited_without_a_secret,
             the_signing_key_rotates,

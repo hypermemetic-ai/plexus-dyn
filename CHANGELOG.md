@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.1]
+
+On plexus-core 0.11.1.
+
+KEEL-19 (security, High): **`dyn.exchange` is decided where a call back is
+decided.** In 0.2.0 it checked only that the audience was a keyed,
+unrevoked peer. Now the presenter — the subject token's audience, proven by
+its proof — must be a peer mounted here, not revoked, holding a consented
+need that covers the audience and the method asked
+(`dyn.peer.<audience>.<m>` for the audience's `<backend>.<m>`, or
+`<audience>.<m>` for a peer at the top level), held by the subject token
+(plexus-core's `RemoteChild::may_exchange`). `method` is required. The
+token's scope is `method` on the scopes both the subject holds that need on
+and consent allows, narrowed to `scope` when asked; it is bound to the
+presenter's key, so the audience takes it only with the presenter's proof;
+and a subject token is exchanged once per audience and method. A refusal's
+message names its reason in brackets (`[not_consented]`, `[presenter]`,
+`[revoked]`, `[again]`, `[proof]`, `[subject]`, `[audience]`) and is
+audited (`plexus::audit`). A revoked presenter is refused at once.
+
 ## [0.2.0] — unreleased
 
 On plexus-core, plexus-macros and plexus-client 0.11 (NEST-24): a new minor,
