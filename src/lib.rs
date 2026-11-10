@@ -752,6 +752,9 @@ impl DynActivation {
     /// connected (one that fails listed down), and the liveness task. Call
     /// once the service is built; safe to call again (it does nothing).
     pub async fn start(&self, service: &DynamicHub) -> Result<(), String> {
+        // KEEL-31: a backstop that does not depend on the macro — refuse to
+        // start if a method that acts on the whole service lost its mark.
+        plexus_core::plexus::require_everywhere(&plexus_core::plexus::Activation::plugin_schema(self), EVERYWHERE)?;
         *self.inner.host.lock().unwrap() = Some(service.downgrade());
         if self.inner.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
@@ -1251,6 +1254,12 @@ pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
     Ok(out)
 }
 
+/// KEEL-31: dyn's methods that act on the whole service — its admin writes,
+/// and its reads of every peer, consent and pin — each marked `everywhere`,
+/// which [`DynActivation::start`] checks.
+pub const EVERYWHERE: &[&str] =
+    &["connect", "grow", "disconnect", "consent", "consents", "revoke", "rotate_key", "pins", "repin", "peers", "names"];
+
 /// Runtime peers: connect services, grow dendrites, call them as
 /// `dyn.peer.<name>.<path>.<method>`.
 #[plexus_macros::activation(roles(viewer = ["peers", "names", "consents", "pins"]))]
@@ -1320,7 +1329,7 @@ impl DynActivation {
 
     /// DYNAUTH-5: each peer's registration — its key, what it declares it
     /// needs — and what is consented, what is still pending.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn consents(&self) -> impl Stream<Item = ConsentInfo> + Send + 'static {
         futures::stream::iter(self.consent_list())
     }
@@ -1379,7 +1388,7 @@ impl DynActivation {
     /// NEST-21: every peer's pin — the identity pinned and its fingerprint,
     /// and the identity it last presented and was refused for, with the
     /// fingerprint `dyn.repin` takes.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn pins(&self) -> impl Stream<Item = PinInfo> + Send + 'static {
         futures::stream::iter(self.pin_list())
     }
@@ -1395,13 +1404,13 @@ impl DynActivation {
 
     /// Every peer: its kind, whether it is up, its interface's hash, its
     /// restarts, open calls and calls.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn peers(&self) -> impl Stream<Item = PeerInfo> + Send + 'static {
         futures::stream::iter(self.list())
     }
 
     /// Every peer's name (the slot's list: a slot lists names).
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn names(&self) -> impl Stream<Item = String> + Send + 'static {
         futures::stream::iter(self.list().into_iter().map(|p| p.name))
     }

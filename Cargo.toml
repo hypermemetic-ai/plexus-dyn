@@ -18,7 +18,7 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 # DYNAUTH-8: `child-wss` — a peer beyond loopback is reached by wss://, its
 # certificate validated and its key pinned.
 plexus-core = { version = "0.11.0", features = ["child-wss"] }
-plexus-macros = "0.11.0"
+plexus-macros = "0.11.1"
 plexus-client = "0.11.0"
 # What #[plexus_macros::activation] expands to names these crates.
 async-trait = "0.1"
