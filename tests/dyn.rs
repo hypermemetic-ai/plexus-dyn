@@ -1920,6 +1920,202 @@ async fn a_dendrite_without_its_launcher() {
     assert!(env["home"].as_str().is_some_and(|h| h.ends_with("probe/.home")), "{env:?}");
 }
 
+// ------------------------------------------------------------------ DYNAUTH-31
+
+#[derive(Clone)]
+pub struct ProbeActivation;
+
+/// What an in-process peer serves here.
+#[plexus_macros::activation(namespace = "probe", version = "1.0.0")]
+impl ProbeActivation {
+    /// An answer.
+    #[plexus_macros::method]
+    pub async fn ask(&self) -> Value {
+        json!("asked")
+    }
+
+    /// One item, then the stream stays open.
+    #[plexus_macros::method]
+    pub async fn hold(&self) -> impl Stream<Item = Value> + Send + 'static {
+        futures::stream::once(async { json!("first") }).chain(futures::stream::pending())
+    }
+
+    /// A whole-service method of the peer's.
+    #[plexus_macros::method(everywhere)]
+    pub async fn rotate(&self) -> Value {
+        json!("rotated")
+    }
+}
+
+/// An in-process peer (any `Peer`): `ProbeActivation`, and whom each call
+/// came as — the context it was handed.
+struct Probe {
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl plexus_core::plexus::peer::Peer for Probe {
+    fn interface(&self) -> plexus_core::plexus::peer::Interface {
+        plexus_core::plexus::peer::Peer::interface(&ProbeActivation)
+    }
+    async fn call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, plexus_core::plexus::PlexusError> {
+        self.seen.lock().unwrap().push(auth.and_then(|a| a.principal()).map(|p| p.to_string()).unwrap_or_else(|| "nobody".into()));
+        plexus_core::plexus::peer::Peer::call(&ProbeActivation, method, params, auth).await
+    }
+    async fn peer(&self, name: &str) -> Result<Box<dyn plexus_core::plexus::peer::Peer>, plexus_core::plexus::peer::PeerError> {
+        plexus_core::plexus::peer::Peer::peer(&ProbeActivation, name).await
+    }
+}
+
+fn probe() -> (Arc<dyn plexus_core::plexus::peer::Peer>, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    (Arc::new(Probe { seen: seen.clone() }), seen)
+}
+
+/// DYNAUTH-31: an in-process peer is called through the slot with the
+/// caller's own context, gated as any peer, and dyn mints it no token —
+/// where a call into a keyed peer, in the same service, is minted one.
+async fn dynauth31_an_in_process_peer_is_called_as_its_caller_and_minted_nothing() {
+    use plexus_core::plexus::peer_token::{AuditKind, PeerKey};
+    let records = Arc::new(Records::default());
+    let sink = records.clone();
+    let r = rig_opts(None, move |o| o.audit = Some(plexus_dyn::Audit(sink))).await;
+    let (p, seen) = probe();
+    let got = r.dyn_.attach("p", "test", p.clone(), false);
+    assert!(matches!(&got, plexus_dyn::DynEvent::Connected { name, replaced: false, .. } if name == "p"), "{got:?}");
+    assert!(matches!(r.dyn_.attach("p", "test", p.clone(), false), plexus_dyn::DynEvent::Error { .. }), "a taken name is refused without `replace`");
+    let refused = call(&r, VIEWER, "dyn.peer.p.ask", json!({})).await;
+    assert!(refused[0]["route_error"].as_str().is_some_and(|e| e.contains("dyn.{peer}")), "the gate, as for any peer: {refused:?}");
+    assert_eq!(call(&r, USER, "dyn.peer.p.ask", json!({})).await, [json!("asked")]);
+    assert_eq!(*seen.lock().unwrap(), [USER], "called with the caller's own context");
+    assert!(records.0.lock().unwrap().is_empty(), "no token minted for an in-process peer: {:?}", records.0.lock().unwrap());
+    // The same service mints one for a keyed peer: the sink sees mints.
+    let tk = PeerKey::generate();
+    let tp = free_port();
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set(), &r)).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
+    call(&r, USER, "dyn.peer.t.claims", json!({})).await;
+    let minted: Vec<(AuditKind, String)> = records.0.lock().unwrap().iter().map(|m| (m.kind, m.aud.clone())).collect();
+    assert_eq!(minted, [(AuditKind::Mint, tk.kid().to_string())], "only the keyed peer's call is minted");
+    let listed = peer(&r, "p");
+    assert_eq!(listed.peer, plexus_dyn::PeerKind::InProcess { by: "test".into() });
+    assert!(listed.up && listed.identity.is_none() && listed.interface.is_some(), "{listed:?}");
+    assert_eq!((listed.calls, listed.open), (1, 0));
+    let shown = call(&r, VIEWER, "dyn.peers", json!({})).await;
+    assert!(shown.iter().any(|v| v["name"] == "p" && v["kind"] == "in_process" && v["by"] == "test"), "{shown:?}");
+    t.abort();
+}
+
+/// DYNAUTH-31 (acceptance 3): no token addressed to another peer is
+/// obtained through an in-process peer. It holds none (nothing is minted
+/// for it); it is no exchange's audience; and a token as dyn would mint for
+/// a peer on its own pipe — the nearest thing an unkeyed peer could hold —
+/// is not exchanged for one addressed to the keyed peer `t`.
+async fn dynauth31_no_token_for_another_peer_through_an_in_process_peer() {
+    use plexus_core::plexus::peer_token::{prove, MintRequest, PeerKey, EXCHANGE};
+    let r = rig().await;
+    let (p, _) = probe();
+    r.dyn_.attach("p", "test", p, false);
+    let tk = PeerKey::generate();
+    let tp = free_port();
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set(), &r)).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
+    let exchange = |subject: String, proof: String, audience: &str, method: &str| {
+        let ask = json!({ "subject_token": subject, "proof": proof, "audience": audience, "method": method });
+        let host = r.host.clone();
+        async move { items(host.route("dyn.exchange", ask, None).await).await.remove(0) }
+    };
+    // Not an audience: a real subject (t's token for a user's call), its real proof.
+    let told = call(&r, USER, "dyn.peer.t.claims", json!({})).await.remove(0);
+    let token = told["token"].as_str().unwrap().to_string();
+    let proof = prove(&tk, &token, EXCHANGE, told["claims"]["call"].as_str().unwrap());
+    let got = exchange(token, proof, "p", "probe.ask").await;
+    assert!(got["type"] == "error" && got["message"].as_str().is_some_and(|m| m.contains("[audience]")), "{got:?}");
+    // Not a presenter: what an unkeyed peer could hold is bound to no key, and refused.
+    let (theirs, claims) = r.dyn_.issuer().mint(MintRequest { sub: USER.into(), peer_key: None, name: "p".into(), scope: vec!["dyn.{peer}@*".into()], call: "c-p".into(), method: "probe.ask".into(), presented: None }).unwrap();
+    assert_eq!(claims.aud, "pipe:p");
+    let forged = prove(&PeerKey::generate(), &theirs, EXCHANGE, "c-p");
+    let got = exchange(theirs, forged, "t", "tell.claims").await;
+    assert_eq!(got["type"], "error", "no token for t through p: {got:?}");
+    assert!(got["message"].as_str().is_some_and(|m| m.contains("the exchange is refused")), "{got:?}");
+    t.abort();
+}
+
+/// DYNAUTH-31: consent gives an in-process peer `callers` — every method but
+/// one it marks `everywhere` (KEEL-31) — and no needs: it declares none.
+async fn dynauth31_consent_gives_an_in_process_peer_callers_only() {
+    let r = rig().await;
+    let (p, _) = probe();
+    r.dyn_.attach("p", "test", p, false);
+    let needs = call(&r, ADMIN, "dyn.consent", json!({ "peer": "p", "needs": ["dyn.peers"] })).await;
+    assert!(needs[0]["type"] == "error" && needs[0]["message"].as_str().is_some_and(|m| m.contains("nothing")), "{needs:?}");
+    let ok = call(&r, ADMIN, "dyn.consent", json!({ "peer": "p", "callers": ["viewer"] })).await;
+    assert_eq!(ok[0]["type"], "consented", "{ok:?}");
+    assert_eq!(call(&r, VIEWER, "dyn.peer.p.ask", json!({})).await, [json!("asked")]);
+    let rotate = call(&r, VIEWER, "dyn.peer.p.rotate", json!({})).await;
+    assert!(rotate[0]["route_error"].is_string(), "consent hands no everywhere method: {rotate:?}");
+    assert_eq!(call(&r, ADMIN, "dyn.peer.p.rotate", json!({})).await, [json!("rotated")]);
+    let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
+    let mine = listed.iter().find(|c| c["peer"] == "p").unwrap();
+    assert!(mine.get("key").is_none() && mine.get("declared").is_none(), "{mine:?}");
+}
+
+/// Open `method` as `caller` and take its first item; the rest is read later.
+async fn opened(r: &Rig, caller: &str, method: &str) -> (Value, PlexusStream) {
+    let mut s = r.host.route(method, json!({}), Some(&who(caller))).await.unwrap();
+    let first = match s.next().await {
+        Some(PlexusStreamItem::Data { content, .. }) => content.into_value(),
+        other => panic!("{other:?}"),
+    };
+    (first, s)
+}
+
+/// What is left of an open stream, within a second (it must end).
+async fn rest(s: PlexusStream) -> Vec<Value> {
+    tokio::time::timeout(Duration::from_secs(1), items(Ok(s))).await.expect("the open call ended")
+}
+
+/// DYNAUTH-31: `dyn.revoke` and `dyn.disconnect` stop an in-process peer as
+/// any peer: an open call ends saying why, the next is refused; the
+/// revocation stands when it is attached again (as at a restart) and ends
+/// only with `replace`, an admin's new registration.
+async fn dynauth31_revoke_and_disconnect_stop_an_in_process_peer() {
+    let r = rig().await;
+    let (p, _) = probe();
+    r.dyn_.attach("p", "test", p.clone(), false);
+    let (first, open) = opened(&r, USER, "dyn.peer.p.hold").await;
+    assert_eq!(first, json!("first"));
+    assert_eq!(peer(&r, "p").open, 1);
+    let revoked = call(&r, ADMIN, "dyn.revoke", json!({ "peer": "p", "why": "its bridge leaked" })).await;
+    assert_eq!(revoked[0]["type"], "revoked", "{revoked:?}");
+    let ended = rest(open).await;
+    assert!(ended[0]["message"].as_str().is_some_and(|m| m.contains("its bridge leaked")), "{ended:?}");
+    let next = call(&r, ADMIN, "dyn.peer.p.ask", json!({})).await;
+    assert!(next[0]["message"].as_str().is_some_and(|m| m.contains("revoked")), "{next:?}");
+    let listed = peer(&r, "p");
+    assert!(listed.revoked.as_deref() == Some("its bridge leaked") && !listed.up && listed.open == 0, "{listed:?}");
+    // Let go and attached again, as at a restart: still revoked.
+    assert!(r.dyn_.detach("p", &p));
+    r.dyn_.attach("p", "test", p.clone(), false);
+    assert!(call(&r, ADMIN, "dyn.peer.p.ask", json!({})).await[0]["message"].as_str().is_some_and(|m| m.contains("revoked")));
+    // `replace`: a new registration, the revocation ends.
+    r.dyn_.attach("p", "test", p.clone(), true);
+    assert_eq!(peer(&r, "p").revoked, None);
+    assert_eq!(call(&r, USER, "dyn.peer.p.ask", json!({})).await, [json!("asked")]);
+    // Disconnected: the open call ends, the name is gone.
+    let (_, open) = opened(&r, USER, "dyn.peer.p.hold").await;
+    assert_eq!(call(&r, ADMIN, "dyn.disconnect", json!({ "name": "p" })).await[0]["type"], "disconnected");
+    let ended = rest(open).await;
+    assert!(ended[0]["message"].as_str().is_some_and(|m| m.contains("disconnected")), "{ended:?}");
+    let gone = call(&r, USER, "dyn.peer.p.ask", json!({})).await;
+    assert!(gone[0]["message"].as_str().is_some_and(|m| m.contains("no peer named `p`")), "{gone:?}");
+    // Another holder of the name is not let go by the one before.
+    let (other, _) = probe();
+    r.dyn_.attach("p", "test", other, false);
+    assert!(!r.dyn_.detach("p", &p), "detach lets go only of the peer it names");
+    assert!(r.dyn_.list().iter().any(|x| x.name == "p"));
+}
+
 fn main() {
     // DYNAUTH-7: every `plexus::audit` line, kept for a test to read.
     tracing_subscriber::fmt().with_env_filter("plexus::audit=info").with_writer(|| AuditWriter).with_ansi(false).init();
@@ -1974,7 +2170,11 @@ fn main() {
             a_setting_flipped_through_config_takes_effect_live,
             dyn_settings_are_on_the_service_configuration,
             repin_takes_only_the_presented_fingerprint,
-            repin_on_valid_cert_follows_a_renewed_certificate
+            repin_on_valid_cert_follows_a_renewed_certificate,
+            dynauth31_an_in_process_peer_is_called_as_its_caller_and_minted_nothing,
+            dynauth31_no_token_for_another_peer_through_an_in_process_peer,
+            dynauth31_consent_gives_an_in_process_peer_callers_only,
+            dynauth31_revoke_and_disconnect_stop_an_in_process_peer
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });
