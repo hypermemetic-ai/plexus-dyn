@@ -13,7 +13,7 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.names` | viewer | each peer's name — the slot's list |
 | `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
 | `dyn.jwks` | public | DYNAUTH-12: the JWK Set (Ed25519, `kid` = `key:<hex>`) a peer verifies this service's tokens with |
-| `dyn.exchange { subject_token, proof, audience, scope?, method? }` | public | DYNAUTH-6: RFC 8693 token exchange — a peer's token, with its proof of possession (method `exchange`, the token's `call`), for one addressed to the connected keyed peer `audience`, its scope never wider |
+| `dyn.exchange { subject_token, proof, audience, scope?, method? }` | public | DYNAUTH-6: RFC 8693 token exchange — a peer's token, with its proof of possession (method `exchange`, the token's `call`), for one addressed to the connected keyed peer `audience` and its `method`, its scope never wider. KEEL-19: only for a presenter mounted here, not revoked and consented to reach `dyn.peer.<audience>.<m>`; bound to the presenter's key; once per subject, audience and method |
 | `dyn.revoke { peer, why? }` | admin | DYNAUTH-7: nothing forwarded to it from now (no token minted), its calls back end, its consent goes; listed revoked until connected or grown again with `replace` |
 | `dyn.rotate_key` | admin | DYNAUTH-7: a new signing key from now; the old one in `dyn.jwks` for one token lifetime |
 | `dyn.consents` | viewer | each peer's key (proved at `_info`), declared needs, consented needs and callers, what is pending |
@@ -127,7 +127,11 @@ proves at `_info` (a nonce signed; plexus-core's `ServeChild::key` on the
 far side) — pinned with its identity, so a remount proving another key is
 refused (`identity_changed`) until `connect … replace` — and the `needs` its
 schema declares. A dendrite on its pipe proves no key: the pipe is the
-host's own.
+host's own. KEEL-19: the proof is made for its asker — the principal the
+peer's connection proved (a keyed peer is served on plexus-core's
+`ChildPeer::connection`, never a `Pipe`) — so a proof one peer asks of
+another and relays is refused; and one key is one peer: a peer proving a
+key another peer here holds is refused (`identity_changed`, its message `key_in_use: …`).
 
 Declared needs are a request. Until an admin answers it with `dyn.consent`
 every one is refused upward (`forbidden`, `not_needed`, "no admin has
@@ -150,11 +154,121 @@ peer's consented needs within the call's reach, `call` and `method` the
 forwarded call, `jti`, at most 60 s. A dendrite on its pipe gets one too,
 addressed `pipe:<name>` and bound to no key. A peer verifies with
 `dyn.jwks` (plexus-core's `Verifier`, `ServeChild::tokens`): the algorithm
-pinned, the audience its own, fresh, each `jti` once. Calling back under a
+pinned, the audience its own, fresh, each `jti` once — and, KEEL-19, sent
+with the service's proof that it sends it (`hop.proof`, by the key that
+signed the token), over a connection proven as the service. Calling back under a
 key-bound token, a peer sends a proof of possession by its key for that
 method and call (plexus-core's `host()` does it); without one it is
 refused. The signing key is `<data-dir>/dyn.key` (0600), denied to every
 dendrite. A WebSocket peer that proves no key gets no token.
+
+## The dial key and the data directory (KEEL-19)
+
+`dyn` dials every peer with a key of its own, `<data_dir>/dial.key` (0600,
+made at the first start; `DynOptions::child.key` names another), apart from
+the token-signing `dyn.key`. Its principal, `key:<hex>`, is
+`DynActivation::dial_principal()` (the example prints it at start,
+`dial principal: key:…`; plexus-core's `remote_child::key_principal(path)`
+reads it from the file). A keyed peer serves itself with plexus-core's
+`serve_child_ws`, trusting that principal (its `trusted`): the peer believes
+a forwarded hop only from a connection whose upgrade that key proved. The
+key is the service's identity to its peers: keep it, and when it changes
+(a new data directory, a deleted file, `child.key` moved) every keyed peer
+must be told the new principal. `dyn.rotate_key` rotates the token key
+only, never the dial key.
+
+The data directory defaults to `$XDG_DATA_HOME/plexus-dyn`, else
+`~/.local/share/plexus-dyn` (no longer `/tmp/plexus-dyn`). It is made 0700;
+one that is a symbolic link, another user's, or open to group or others is
+refused — `start` answers why, naming it, and no key or consent is read
+from it or kept in it. One an earlier version made 0755 is refused until
+`chmod 700 DIR`.
+
+## The rules a keyed peer and its service apply (KEEL-19)
+
+What the code checks, in order — the text a change to `remote_child` or
+`peer_token` is checked against.
+
+**Before a peer runs a hop** (`{ns}.call` for method M; a schema call needs
+none of this):
+
+1. A child with a key, or verifying tokens addressed to a key, is served
+   only by `serve_child_proven`, which takes a `Proven` — a type with no
+   constructor from a string, made only by `KeyedUpgrade::verify` checking
+   the upgrade's `plexus-key.` proof (`serve_child_ws` does it) — and is
+   believed from that principal alone. `serve_child_with` refuses one,
+   whatever `ChildPeer` it is given.
+2. A keyless, non-verifying child (`serve_child_with`) believes every
+   sender its `ChildPeer` takes. Served as `ChildPeer::Pipe` on a
+   WebSocket, it believes every sender who can reach that socket, as
+   whoever the frame claims to be. **Do not do this**: a keyless child
+   belongs on its parent's stdin/stdout or a socket only that parent can
+   open; a child reachable over a network has a key and is served with
+   `serve_child_ws`. On `ChildPeer::connection` the sender is the string it
+   was given, which proves nothing by itself.
+3. With a verifier, the hop's token must verify: an EdDSA JWS signed by a trusted
+   JWKS key (`iss` = `kid`), `aud` this child, within its times, naming
+   `hop.call` and M, its `sub` the hop's caller, its scope holding the
+   hop's grant on every scope the hop says.
+4. And its sender must be proven by `hop.proof` over (token, M, `hop.call`):
+   a token bound to this child's own key (or, to a pipe, to none) is the
+   service's forward — the proof by its issuer key, and on a connection a
+   sender `ChildPeer` takes; a token bound to another key is an exchanged
+   one — the proof by that key, over a connection proven as it, which the
+   hop names. Only then is the token's `jti` spent (once).
+5. Then the far side's own check (the hop's grant is M or M's slot) and M
+   runs as the hop's caller, within the scopes the hop says.
+
+**Before a service mounts a keyed peer** (`RemoteChild::connect`):
+
+1. It dials with its own key proof on the upgrade (`ChildOptions::key`;
+   plexus-dyn: `<data_dir>/dial.key` by default), so its principal is the
+   `key:` the peer's transport proves.
+2. It asks `_info {nonce, asker}`; a peer that names a key must prove it
+   with `plexus-peer-key/v2` over (nonce, backend, the asker its connection
+   proved), checked against the service's own principal — refused when
+   that principal is not a key (`keyed_mount_needs_a_key`) or the proof was
+   made for anyone else.
+3. The key is pinned with the peer's identity: a remount proving another
+   is refused (`identity_changed`); plexus-dyn refuses a key another peer
+   holds, mounted or pinned (`identity_changed`, `key_in_use:`), checked
+   where the entry is reserved.
+4. Tokens are minted for that key only while it is mounted and not
+   revoked — asked at the top of each forward and again, after the dial
+   it may await, where the token is minted and where its call back is
+   opened — by a service whose principal is a key; each forwarded hop
+   carries the service's proof (`TokenIssuer::prove_forward`).
+5. An exchange (`dyn.exchange`) is decided as a call back is: the presenter
+   mounted, not revoked, holding a consented need for the audience and the
+   method, within the consent of now; once per (`jti`, audience, method);
+   the token bound to the presenter's key.
+
+Replay: an upgrade's key proof is taken once while its 60 s window lasts,
+and a token's `jti` once while it lives. `KeyedUpgrade` holds at most 4096
+proofs (`UPGRADE_LEDGER_MAX`); full, it **refuses** a new upgrade — never
+forgets a proof early — until proofs leave their window: the dialer gets
+HTTP 401 with `this child holds 4096 key proofs in their 60 s window: a new
+upgrade is refused until some expire`, and the child logs a warning on
+target `plexus::audit` (`child upgrade ledger full`, with the count held
+and refused) at most once per 10 s. So at most 4096 upgrades a minute are
+taken per child (about 68 a second, sustained); a flood can deny upgrades
+for a minute, never replay one. Both are kept in memory: a restarted child
+forgets, so a proof or token captured in the 60 s before a restart can be
+replayed to it once after it (a token only while it lives, at most its
+`exp`).
+
+Key files and the data directory are the user's own, 0600 and 0700, never
+read through a symbolic link.
+
+A child dial's key proof is spec/00's one form, signed as the reserved agent
+`plexus.child-dial` (`CHILD_DIAL_AGENT`; `agent` is in the signed bytes): a
+child takes only that agent, so a sign-in proof replayed to a child at
+the same URL is refused. A server's sign-in (plexus-auth-core's
+`KeyProofAdapter`) takes a dial proof as the dialing key's sign-in, by
+design: a dial proof is addressed to the dialed URL and usable only there,
+and it is how a service mounts another service behind key sign-in
+(`--child far=wss://…`, `dyn.connect`). A context of its own would be a
+plexus-wire spec/00 change, not made.
 
 ## Onward calls (DYNAUTH-6)
 
@@ -165,6 +279,17 @@ peer, the token minted for it is an exchange of the presented one: the
 original caller stays `sub`, `act` names each hop nearest first (`{sub:
 host, act: {sub: <presenter>, act: {sub: host}}}`), and its scope is never
 wider. `dyn.exchange` does the same as a method.
+
+KEEL-19: `dyn.exchange` is decided as a call back is — the presenter (the
+subject token's audience) must be mounted here, not revoked, and hold a
+consented need that covers the audience and the method asked
+(`dyn.peer.<audience>.<m>`); anything else is refused, its reason in
+brackets, and audited. The token it gives is bound to the presenter's key
+(`cnf`): the audience takes it only with the presenter's proof
+(`hop.proof`, by `prove(key, token, <method>, <hop.call>)`), over a
+connection proven as that key. A token the service forwards is taken only
+from the service's own connection. A subject token is exchanged once per
+audience and method.
 
 ## Revocation and audit (DYNAUTH-7)
 

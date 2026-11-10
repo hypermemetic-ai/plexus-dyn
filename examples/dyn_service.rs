@@ -45,6 +45,9 @@ async fn main() -> anyhow::Result<()> {
     // NEST-21: the service's configuration served as `config`.
     let service = Arc::new(DynamicHub::new("svc").register(dyn_.clone()).with_config_service());
     dyn_.start(&service).await.map_err(|e| anyhow::anyhow!(e))?;
+    // KEEL-19: the principal this service dials its peers as — what each
+    // keyed peer trusts (`serve_child_ws`'s `trusted`).
+    eprintln!("dial principal: {}", dyn_.dial_principal().unwrap_or_else(|| "none (no keyed peer mounts)".into()));
     for p in dyn_.list() {
         eprintln!("peer {}: {}", p.name, if p.up { "up".to_string() } else { format!("down ({})", p.why.unwrap_or_default()) });
     }
