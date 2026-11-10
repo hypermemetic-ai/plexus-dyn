@@ -57,6 +57,10 @@ rcgen = "0.14"
 tempfile = "3"
 # A peer that goes silent (tests/dyn.rs): a raw WebSocket server.
 tokio-tungstenite = "0.30"
+# NEST-25: a raw dialing node signs its offer by hand (tests/nest25_dial_in.rs).
+ed25519-dalek = "2"
+# NEST-25: the host's key sign-in at the upgrade (KeyProofAdapter).
+plexus-auth-core = { version = "0.3.2", features = ["adapters"] }
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
