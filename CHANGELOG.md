@@ -22,14 +22,27 @@ audited (`plexus::audit`). A revoked presenter is refused at once.
 
 Second pass: **a key is mounted once.** A peer proving a key another peer
 here holds (mounted, or pinned) is refused — `refused` with
-`Refusal::KeyInUse` (new: breaking for an exhaustive match), audited — at
-`connect`/`grow` and at a remount; so a token addressed to a key, and an
+`Refusal::IdentityChanged`, its message starting `key_in_use:`, `old` the
+holder's pin, audited — at `connect`/`grow` and at a remount (checked again
+where the entry is reserved, under one hold of the lock: two connects
+racing on one key mount one); so a token addressed to a key, and an
 exchange's presenter found by its key, name one peer, and a revoked peer's
 key gets no sibling mount. With plexus-core 0.11.1 a keyed peer is served on
 `ChildPeer::connection` (the tests' WebSocket peers are served as proven
 `service:dyn`), every forwarded hop carries the service's proof, and a
 consent narrowed under an open call narrows its next call back. Both sides
 upgrade together (plexus-core's CHANGELOG).
+
+Third pass: **`dyn` dials with a key by default** — `<data_dir>/dial.key`
+(0600, made when missing; `DynOptions::child.key` overrides), its own, not
+the token-signing `dyn.key`: a peer trusts the dial key as the service
+acting for others, the JWKS key signs tokens and forward proofs, and
+rotating one changes only its role (`dyn.rotate_key` leaves the dial
+identity; a new dial key must be re-trusted by the peers). Its principal is
+`DynActivation::dial_principal()`; without a dial key no keyed peer mounts.
+The dial key is denied to every dendrite. The tests serve keyed peers with
+plexus-core's `serve_child_ws` (the upgrade's key proof verified), never on
+a name.
 
 ## [0.2.0] — unreleased
 

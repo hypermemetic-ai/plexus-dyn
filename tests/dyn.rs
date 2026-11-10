@@ -384,7 +384,6 @@ async fn served_peer<A>(port: u16, activation: A, opts: plexus_core::plexus::rem
 where
     A: plexus_core::plexus::Activation + Clone + Send + Sync + 'static,
 {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let deadline = Instant::now() + Duration::from_secs(5);
     let listener = loop {
         match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -396,60 +395,41 @@ where
             Err(e) => panic!("port {port}: {e}"),
         }
     };
+    // KEEL-19: each upgrade's key proof verified (plexus-core's
+    // `serve_child_ws`), the child served on a connection proven as the key
+    // that dialed — `opts.peer` names whom it trusts to act for others.
+    let upgrade = Arc::new(plexus_core::plexus::remote_child::KeyedUpgrade::new([format!("ws://127.0.0.1:{port}")]));
+    let trusted = match &opts.peer {
+        plexus_core::plexus::remote_child::ChildPeer::Connection { acts_for_others, .. } => acts_for_others.clone(),
+        plexus_core::plexus::remote_child::ChildPeer::Pipe => Vec::new(),
+    };
     tokio::spawn(async move {
         let mut conns = tokio::task::JoinSet::new();
         loop {
             let Ok((tcp, _)) = listener.accept().await else { break };
-            let opts = opts.clone();
-            let activation = activation.clone();
+            let (activation, upgrade, trusted, key, tokens) = (activation.clone(), Arc::clone(&upgrade), trusted.clone(), opts.key.clone(), opts.tokens.clone());
             conns.spawn(async move {
-                let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else { return };
-                let (mut sink, mut stream) = ws.split();
-                let (mut in_w, in_r) = tokio::io::duplex(1 << 20);
-                let (out_w, out_r) = tokio::io::duplex(1 << 20);
-                let pump_in = async move {
-                    while let Some(Ok(m)) = stream.next().await {
-                        match m {
-                            tokio_tungstenite::tungstenite::Message::Text(t) => {
-                                if in_w.write_all(t.as_bytes()).await.is_err() || in_w.write_all(b"\n").await.is_err() {
-                                    break;
-                                }
-                            }
-                            tokio_tungstenite::tungstenite::Message::Close(_) => break,
-                            _ => {}
-                        }
-                    }
-                };
-                let pump_out = async move {
-                    let mut lines = tokio::io::BufReader::new(out_r).lines();
-                    while let Ok(Some(l)) = lines.next_line().await {
-                        if sink.send(tokio_tungstenite::tungstenite::Message::text(l)).await.is_err() {
-                            break;
-                        }
-                    }
-                };
-                let serve = plexus_core::plexus::remote_child::serve_child_with(activation, in_r, out_w, opts);
-                tokio::select! {
-                    _ = async { tokio::join!(pump_in, pump_out, serve) } => {}
-                }
+                let _ = plexus_core::plexus::remote_child::serve_child_ws(activation, tcp, &upgrade, trusted, key, tokens).await;
             });
         }
     })
 }
 
-/// The principal `dyn`'s mounts act as (`ChildOptions::for_service("dyn")`).
+/// The name `dyn` acts as when it has no dial key — which no transport
+/// proves (KEEL-19: no keyed peer may be served on it).
 const DYN: &str = "service:dyn";
 
-/// KEEL-19: a keyed peer is served on a connection proven as its sender —
-/// never a `Pipe` (refused). The stand-in WebSocket server proves nothing
-/// itself; the only one that dials it is `dyn`, so it stands for a
-/// transport that proved `dyn`'s principal.
-fn proven_dyn() -> plexus_core::plexus::remote_child::ChildPeer {
-    plexus_core::plexus::remote_child::ChildPeer::connection(DYN, [DYN.to_string()])
+/// KEEL-19: whom a keyed peer trusts to act for others — `r`'s `dyn`, by the
+/// key it dials with (`<data_dir>/dial.key`). `served_peer` serves each
+/// connection proven as the key its upgrade's proof verified
+/// (`serve_child_ws`); the `proven` here is replaced by that.
+fn trusting(r: &Rig) -> plexus_core::plexus::remote_child::ChildPeer {
+    let dial = r.dyn_.dial_principal().expect("dyn dials with a key by default");
+    plexus_core::plexus::remote_child::ChildPeer::connection("(proven at the upgrade)", [dial])
 }
 
-fn keyed(key: &plexus_core::plexus::peer_token::PeerKey) -> plexus_core::plexus::remote_child::ServeChild {
-    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), peer: proven_dyn(), tokens: None }
+fn keyed(key: &plexus_core::plexus::peer_token::PeerKey, r: &Rig) -> plexus_core::plexus::remote_child::ServeChild {
+    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), peer: trusting(r), tokens: None }
 }
 
 /// A viewer reaches a peer once an admin consents to its role calling it;
@@ -500,8 +480,8 @@ async fn a_peer_whose_key_changed_is_refused_at_remount() {
     let port = free_port();
     let url = format!("ws://127.0.0.1:{port}");
     let (one, two) = (PeerKey::generate(), PeerKey::generate());
-    let first = keyed_peer(port, keyed(&one)).await;
     let r = rig().await;
+    let first = keyed_peer(port, keyed(&one, &r)).await;
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "k", "url": url })).await;
     assert_eq!(got[0]["type"], "connected", "{got:?}");
     let p = peer(&r, "k");
@@ -514,7 +494,7 @@ async fn a_peer_whose_key_changed_is_refused_at_remount() {
     // (Another key restarts on the same port.)
     first.abort();
     let _ = first.await;
-    let second = keyed_peer(port, keyed(&two)).await;
+    let second = keyed_peer(port, keyed(&two, &r)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let got = call(&r, USER, "dyn.peer.k.forecast", json!({ "city": "oslo" })).await;
@@ -540,9 +520,9 @@ async fn a_peer_whose_key_changed_is_refused_at_remount() {
 // ------------------------------------------------------------------ DYNAUTH-12
 
 /// A far side that verifies: its key, and the host's JWKS trusted.
-fn verifying(key: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core::plexus::peer_token::Jwks) -> plexus_core::plexus::remote_child::ServeChild {
+fn verifying(key: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core::plexus::peer_token::Jwks, r: &Rig) -> plexus_core::plexus::remote_child::ServeChild {
     let v = plexus_core::plexus::peer_token::Verifier::new(key.kid(), jwks).unwrap();
-    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), tokens: Some(Arc::new(v)), peer: proven_dyn() }
+    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), tokens: Some(Arc::new(v)), peer: trusting(r) }
 }
 
 /// A far side that verifies takes a call by the token `dyn` minted for it;
@@ -556,7 +536,7 @@ async fn a_verifying_peer_takes_a_call_by_its_token() {
     assert_eq!(jwks[0]["keys"][0]["kid"], r.dyn_.issuer().kid(), "{jwks:?}");
     let key = PeerKey::generate();
     let port = free_port();
-    let peer_task = keyed_peer(port, verifying(&key, &r.dyn_.jwk_set())).await;
+    let peer_task = keyed_peer(port, verifying(&key, &r.dyn_.jwk_set(), &r)).await;
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{port}") })).await;
     assert_eq!(got[0]["type"], "connected", "{got:?}");
     assert_eq!(call(&r, USER, "dyn.peer.v.forecast", json!({ "city": "oslo" })).await.len(), 7, "taken by its token");
@@ -566,7 +546,7 @@ async fn a_verifying_peer_takes_a_call_by_its_token() {
     // A peer trusting another issuer refuses this one's tokens. (KEEL-19:
     // a key of its own — `v`'s is `v`'s alone here.)
     let port = free_port();
-    let stranger = keyed_peer(port, verifying(&PeerKey::generate(), &Jwks { keys: vec![PeerKey::generate().jwk()] })).await;
+    let stranger = keyed_peer(port, verifying(&PeerKey::generate(), &Jwks { keys: vec![PeerKey::generate().jwk()] }, &r)).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "s", "url": format!("ws://127.0.0.1:{port}") })).await;
     let refused = call(&r, USER, "dyn.peer.s.forecast", json!({ "city": "oslo" })).await;
     assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("token is refused") && m.contains("not trusted")), "{refused:?}");
@@ -574,7 +554,7 @@ async fn a_verifying_peer_takes_a_call_by_its_token() {
     // A peer that verifies, under a `dyn` that mints no tokens: refused.
     let r2 = rig_opts(None, |o| o.tokens = false).await;
     let port = free_port();
-    let strict = keyed_peer(port, verifying(&key, &r2.dyn_.jwk_set())).await;
+    let strict = keyed_peer(port, verifying(&key, &r2.dyn_.jwk_set(), &r2)).await;
     call(&r2, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{port}") })).await;
     let refused = call(&r2, USER, "dyn.peer.v.forecast", json!({ "city": "oslo" })).await;
     assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("no token")), "{refused:?}");
@@ -679,8 +659,8 @@ async fn an_onward_call_is_an_exchange() {
     let r = rig().await;
     let (tk, rk) = (PeerKey::generate(), PeerKey::generate());
     let (tp, rp) = (free_port(), free_port());
-    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
-    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set(), &r)).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set(), &r)).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
     call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims"] })).await;
@@ -776,8 +756,8 @@ async fn pair(consent: bool) -> Pair {
     let r = rig().await;
     let (tk, rk) = (PeerKey::generate(), PeerKey::generate());
     let (tp, rp) = (free_port(), free_port());
-    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
-    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set(), &r)).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set(), &r)).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
     if consent {
@@ -937,21 +917,75 @@ async fn keel19_a_key_is_mounted_once() {
     let r = rig().await;
     let k = PeerKey::generate();
     let (p1, p2) = (free_port(), free_port());
-    let one = keyed_peer(p1, keyed(&k)).await;
-    let two = keyed_peer(p2, keyed(&k)).await;
+    let one = keyed_peer(p1, keyed(&k, &r)).await;
+    let two = keyed_peer(p2, keyed(&k, &r)).await;
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "a", "url": format!("ws://127.0.0.1:{p1}") })).await;
     assert_eq!(got[0]["type"], "connected", "{got:?}");
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "b", "url": format!("ws://127.0.0.1:{p2}") })).await;
     assert_eq!(got[0]["type"], "refused", "{got:?}");
-    assert_eq!(got[0]["reason"], "key_in_use", "{got:?}");
+    assert_eq!(got[0]["reason"], "identity_changed", "{got:?}");
+    assert!(got[0]["message"].as_str().is_some_and(|m| m.starts_with("key_in_use:")), "{got:?}");
     let log = String::from_utf8_lossy(&AUDIT_LOG.lock().unwrap()).to_string();
     assert!(log.contains("its key is another peer's"), "audited");
     // Revoked, its key still is not another's way in.
     call(&r, ADMIN, "dyn.revoke", json!({ "peer": "a", "why": "compromised" })).await;
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "b", "url": format!("ws://127.0.0.1:{p2}") })).await;
-    assert_eq!(got[0]["reason"], "key_in_use", "{got:?}");
+    assert!(got[0]["message"].as_str().is_some_and(|m| m.starts_with("key_in_use:")), "{got:?}");
     one.abort();
     two.abort();
+}
+
+/// KEEL-19 (NN2): connects proving one key, all at once — one mounts, the
+/// others are refused `key_in_use`; never two.
+async fn keel19_two_connects_racing_on_one_key() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let r = rig().await;
+    let k = PeerKey::generate();
+    let ports: Vec<u16> = (0..6).map(|_| free_port()).collect();
+    let mut tasks = Vec::new();
+    for p in &ports {
+        tasks.push(keyed_peer(*p, keyed(&k, &r)).await);
+    }
+    let asks = ports.iter().enumerate().map(|(i, p)| call(&r, ADMIN, "dyn.connect", json!({ "name": format!("k{i}"), "url": format!("ws://127.0.0.1:{p}") })));
+    let got = futures::future::join_all(asks).await;
+    let connected = got.iter().filter(|g| g[0]["type"] == "connected").count();
+    assert_eq!(connected, 1, "exactly one mounts: {got:?}");
+    assert!(got.iter().filter(|g| g[0]["type"] != "connected").all(|g| g[0]["message"].as_str().is_some_and(|m| m.starts_with("key_in_use:"))), "{got:?}");
+    let holding = r.dyn_.list().into_iter().filter(|p| p.identity.as_ref().and_then(|i| i.key.as_deref()) == Some(k.kid())).count();
+    assert_eq!(holding, 1);
+    for t in tasks {
+        t.abort();
+    }
+}
+
+/// KEEL-19 (NN1): `dyn` dials with a key by default (`<data_dir>/dial.key`,
+/// 0600, not the signing key), so a keyed peer's `_info` proof is made for
+/// a principal its transport proved; and a keyed peer is never served on a
+/// connection "proven" as `service:dyn`, a name no transport proves.
+async fn keel19_dyn_dials_with_a_key_and_no_peer_trusts_a_name() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let r = rig().await;
+    let dial = r.dyn_.dial_principal().expect("a dial key by default");
+    assert!(dial.starts_with("key:") && dial != r.dyn_.issuer().kid(), "its own key, not the signing key: {dial}");
+    let file = r.dyn_.options().data_dir.join("dial.key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    let k = PeerKey::generate();
+    let port = free_port();
+    let v = keyed_peer(port, keyed(&k, &r)).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{port}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    assert_eq!(peer(&r, "v").identity.and_then(|i| i.key), Some(k.kid().to_string()));
+    v.abort();
+    // The old rig's pattern: refused before it serves a line.
+    let (_to, v_in) = tokio::io::duplex(1 << 10);
+    let (v_out, _from) = tokio::io::duplex(1 << 10);
+    let named = plexus_core::plexus::remote_child::ServeChild { key: Some(k.clone()), peer: plexus_core::plexus::remote_child::ChildPeer::connection(DYN, [DYN.to_string()]), tokens: None };
+    let served = tokio::time::timeout(Duration::from_secs(2), plexus_core::plexus::remote_child::serve_child_with(WeatherActivation, v_in, v_out, named)).await.expect("refused at once");
+    assert_eq!(served.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
 }
 
 // ------------------------------------------------------------------ DYNAUTH-7
@@ -986,7 +1020,7 @@ async fn a_revoked_peer_is_refused_and_its_tokens_expire() {
     let r = rig().await;
     let tk = PeerKey::generate();
     let tp = free_port();
-    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set(), &r)).await;
     let url = format!("ws://127.0.0.1:{tp}");
     call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": url })).await;
     call(&r, ADMIN, "dyn.consent", json!({ "peer": "t", "callers": ["viewer"] })).await;
@@ -1024,8 +1058,8 @@ async fn every_hop_is_audited_without_a_secret() {
     let r = rig_opts(None, move |o| o.audit = Some(plexus_dyn::Audit(sink))).await;
     let (tk, rk) = (PeerKey::generate(), PeerKey::generate());
     let (tp, rp) = (free_port(), free_port());
-    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
-    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set(), &r)).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set(), &r)).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
     call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims"] })).await;
@@ -1059,7 +1093,7 @@ async fn the_signing_key_rotates() {
     let r = rig().await;
     let tk = PeerKey::generate();
     let tp = free_port();
-    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set())).await;
+    let t = served_peer(tp, TellActivation, verifying(&tk, &r.dyn_.jwk_set(), &r)).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "t", "url": format!("ws://127.0.0.1:{tp}") })).await;
     let old_jwks = r.dyn_.jwk_set();
     let old = r.dyn_.issuer().kid();
@@ -1114,8 +1148,8 @@ async fn a_keyed_peer_calls_back_with_its_proof() {
     let r = rig().await;
     let (vk, rk) = (PeerKey::generate(), PeerKey::generate());
     let (vp, rp) = (free_port(), free_port());
-    let v = keyed_peer(vp, verifying(&vk, &r.dyn_.jwk_set())).await;
-    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set())).await;
+    let v = keyed_peer(vp, verifying(&vk, &r.dyn_.jwk_set(), &r)).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set(), &r)).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{vp}") })).await;
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
     assert_eq!(got[0]["type"], "connected", "{got:?}");
@@ -1592,8 +1626,8 @@ async fn repin_takes_only_the_presented_fingerprint() {
     let port = free_port();
     let url = format!("ws://127.0.0.1:{port}");
     let (one, two) = (PeerKey::generate(), PeerKey::generate());
-    let first = keyed_peer(port, keyed(&one)).await;
     let r = rig().await;
+    let first = keyed_peer(port, keyed(&one, &r)).await;
     assert_eq!(call(&r, ADMIN, "dyn.connect", json!({ "name": "k", "url": url })).await[0]["type"], "connected");
     let pins = call(&r, VIEWER, "dyn.pins", json!({})).await;
     let pinned_fp = pins[0]["fingerprint"].as_str().expect("pinned").to_string();
@@ -1602,7 +1636,7 @@ async fn repin_takes_only_the_presented_fingerprint() {
     assert_eq!(nothing[0]["reason"], "not_presented", "{nothing:?}");
     first.abort();
     let _ = first.await;
-    let second = keyed_peer(port, keyed(&two)).await;
+    let second = keyed_peer(port, keyed(&two, &r)).await;
     let deadline = Instant::now() + Duration::from_secs(10);
     let presented = loop {
         let _ = call(&r, USER, "dyn.peer.k.forecast", json!({ "city": "oslo" })).await;
@@ -1824,6 +1858,8 @@ fn main() {
             keel19_a_revoked_presenter_is_refused_at_once,
             keel19_a_narrowed_consent_holds_an_open_call,
             keel19_a_key_is_mounted_once,
+            keel19_two_connects_racing_on_one_key,
+            keel19_dyn_dials_with_a_key_and_no_peer_trusts_a_name,
             a_revoked_peer_is_refused_and_its_tokens_expire,
             every_hop_is_audited_without_a_secret,
             the_signing_key_rotates,

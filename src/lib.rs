@@ -344,9 +344,6 @@ pub enum Refusal {
     FingerprintMismatch,
     /// NEST-21: `dyn.repin` on a peer that presented nothing refused.
     NotPresented,
-    /// KEEL-19: it proved a key another peer here already holds — one key,
-    /// one mount.
-    KeyInUse,
 }
 
 /// KEEL-19: the peer other than `name` that holds `key` — mounted under it,
@@ -360,8 +357,11 @@ fn key_held_by(peers: &BTreeMap<String, Entry>, name: &str, key: Option<&str>) -
         .map(|(n, _)| n.clone())
 }
 
+/// KEEL-19: the refusal of a key another peer holds. Said as
+/// `Refusal::IdentityChanged` (the identity it proved is another peer's),
+/// its message starting `key_in_use:`, `old` the holder's pin.
 fn key_in_use(name: &str, key: &str, other: &str) -> String {
-    format!("`{name}` proved the key {key}, which `{other}` holds here: one key is one peer (disconnect `{other}` first)")
+    format!("key_in_use: `{name}` proved the key {key}, which `{other}` holds here: one key is one peer (disconnect `{other}` first)")
 }
 
 /// DYNAUTH-6: what `dyn.exchange` answers (RFC 8693 §2.2's response, as
@@ -458,6 +458,12 @@ struct Inner {
     issuer: Arc<TokenIssuer>,
     /// DYNAUTH-6: the exchange proofs seen, each once.
     proofs: plexus_core::plexus::peer_token::ProofCache,
+    /// KEEL-19: the key `dyn` dials its peers with when `opts.child.key`
+    /// names none — `<data_dir>/dial.key` (0600, made when missing), its
+    /// own, not the token-signing key: a peer trusts it as the service
+    /// acting for others, and rotating either changes only its own role.
+    /// `None` when it could not be read or made: then no keyed peer mounts.
+    dial_key: Option<PathBuf>,
     /// NEST-21: where the settings are read: `DynOptions::config`, or the
     /// service's once started.
     config: Mutex<Config>,
@@ -514,6 +520,7 @@ impl DynActivation {
             issuer = issuer.with_audit(Arc::clone(sink));
         }
         let issuer = Arc::new(issuer);
+        let dial_key = Self::dial_key(&opts);
         Self {
             inner: Arc::new(Inner {
                 opts,
@@ -525,6 +532,7 @@ impl DynActivation {
                 store: Mutex::new(consent::Store::default()),
                 issuer,
                 proofs: Default::default(),
+                dial_key,
                 config: Mutex::new(config.clone()),
             }),
         }
@@ -577,6 +585,28 @@ impl DynActivation {
     /// loudly (tokens still verify against `dyn.jwks`, until a restart).
     fn key_path(opts: &DynOptions) -> PathBuf {
         opts.key_file.clone().unwrap_or_else(|| opts.data_dir.join("dyn.key"))
+    }
+
+    /// KEEL-19: the dial key's file — `opts.child.key` when it names one,
+    /// else `<data_dir>/dial.key`, made (0600) when missing.
+    fn dial_key(opts: &DynOptions) -> Option<PathBuf> {
+        if let Some(k) = &opts.child.key {
+            return Some(k.clone());
+        }
+        let path = opts.data_dir.join("dial.key");
+        match PeerKey::load_or_create(&path) {
+            Ok(_) => Some(path),
+            Err(why) => {
+                tracing::error!(target: "plexus::dyn", "the dial key: {why}; dialing with none, so no keyed peer is mounted");
+                None
+            }
+        }
+    }
+
+    /// KEEL-19: the principal `dyn`'s dial proves to its peers (`key:<hex>`),
+    /// what a keyed peer trusts to act for others; `None` without a dial key.
+    pub fn dial_principal(&self) -> Option<String> {
+        self.inner.dial_key.as_deref().and_then(|p| plexus_core::plexus::remote_child::key_principal(p).ok())
     }
 
     fn signing_key(opts: &DynOptions) -> PeerKey {
@@ -967,6 +997,11 @@ impl DynActivation {
     fn child_options(&self, kind: &PeerKind) -> ChildOptions {
         // NEST-21: the child.* and transport.tls_roots settings, read at each mount.
         let mut o = self.inner.opts.child.clone().configured(&self.config());
+        // KEEL-19: dial with a key by default, so a keyed peer's proof is
+        // made for a principal its transport proved.
+        if o.key.is_none() {
+            o.key = self.inner.dial_key.clone();
+        }
         if self.inner.opts.tokens {
             o.tokens = Some(Arc::clone(&self.inner.issuer));
         }
@@ -1135,17 +1170,35 @@ impl DynActivation {
                 if let Err(message) = self.vet(&name, &child, expecting.as_deref()) {
                     return DynEvent::Error { message };
                 }
-                // KEEL-19: one key, one mount — refused, typed and audited.
-                let held = key_held_by(&self.inner.peers.lock().unwrap(), &name, child.peer_key());
-                if let Some(other) = held {
+                // KEEL-19: one key, one mount — refused, typed and audited:
+                // checked first, and again where the entry is reserved, under
+                // one hold of the lock (two connects racing on one key).
+                let refuse = |peers: &BTreeMap<String, Entry>| {
+                    let other = key_held_by(peers, &name, child.peer_key())?;
                     let key = child.peer_key().unwrap_or_default().to_string();
                     tracing::warn!(target: "plexus::audit", peer = %name, holder = %other, %key, "dyn refused a mount: its key is another peer's");
-                    return DynEvent::Refused { reason: Refusal::KeyInUse, message: key_in_use(&name, &key, &other), old: None, presented: child.identity().map(PeerIdentity::from) };
+                    let old = peers.get(&other).and_then(|e| e.pin.clone());
+                    Some(DynEvent::Refused { reason: Refusal::IdentityChanged, message: key_in_use(&name, &key, &other), old, presented: child.identity().map(PeerIdentity::from) })
+                };
+                let early = refuse(&self.inner.peers.lock().unwrap());
+                if let Some(refused) = early {
+                    return refused;
                 }
                 let schema = plexus_core::plexus::Activation::plugin_schema(&child);
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
                 let pin = child.identity().map(PeerIdentity::from);
+                // DYNAUTH-5: registered — its key and needs — and held to
+                // what is consented for it, before it can be reached.
+                self.register(&name, child.peer_key());
+                self.hold(&name, &child);
+                {
+                    let mut peers = self.inner.peers.lock().unwrap();
+                    if let Some(refused) = refuse(&peers) {
+                        return refused;
+                    }
+                    peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin, presented: None });
+                }
                 // DYNAUTH-7: an admin connecting or growing it again is a
                 // new registration: a revocation ends here.
                 if self.inner.store.lock().unwrap().revoked.remove(&name).is_some() {
@@ -1153,11 +1206,6 @@ impl DynActivation {
                         tracing::error!(target: "plexus::dyn", "{why}");
                     }
                 }
-                // DYNAUTH-5: registered — its key and needs — and held to
-                // what is consented for it.
-                self.register(&name, child.peer_key());
-                self.hold(&name, &child);
-                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin, presented: None });
                 if let Err(message) = self.surface(&name, &child) {
                     self.inner.peers.lock().unwrap().remove(&name);
                     return DynEvent::Error { message };
@@ -1279,6 +1327,8 @@ impl DynActivation {
         let o = &self.inner.opts;
         let mut out = Containment::default_deny(&o.data_dir);
         out.extend(o.child.key.iter().cloned());
+        // KEEL-19: the dial key, wherever it is kept.
+        out.extend(self.inner.dial_key.iter().cloned());
         // DYNAUTH-12: the signing key, wherever it is kept.
         out.extend(o.key_file.iter().cloned());
         out.extend(o.contain.deny.iter().cloned());
