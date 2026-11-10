@@ -606,6 +606,12 @@ async fn an_anonymous_socket_or_an_unproven_key_mounts_nothing_and_learns_nothin
     send(&mut ws, json!({ "jsonrpc": "2.0", "id": "o", "method": "host.offer", "params": { "namespace": "x", "mount": "x", "pairing_nonce": "nn", "possession": "AAAA" } })).await;
     let a = answer_to(&mut ws, "o", 5).await;
     assert_eq!(a.pointer("/error/data/error_kind").and_then(Value::as_str), Some("unauthenticated"), "{a}");
+    // A nonce revealed that is not the one committed to: refused.
+    let mut ws = raw(&host, Some(21)).await;
+    let _ = info(&mut ws, "nn").await;
+    send(&mut ws, json!({ "jsonrpc": "2.0", "id": "o", "method": "host.offer", "params": { "namespace": "x", "mount": "x", "pairing_nonce": "other" } })).await;
+    let a = answer_to(&mut ws, "o", 5).await;
+    assert_eq!(a.pointer("/error/data/error_kind").and_then(Value::as_str), Some("pairing_mismatch"), "{a}");
     assert!(listed(&host).is_empty() && host.dyn_.pending_list().is_empty());
 }
 
