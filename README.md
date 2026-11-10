@@ -373,6 +373,11 @@ everyone's — a known limit; dyn reads no forwarded header (there is no
 trusted-proxy setting here). Admitted keys are never held to any of this:
 an admitted node is mounted, not pended.
 
+**Behind `tailscale serve` or any proxy, every dial-in offer shares one
+address** (`dyn pending` says `from: 127.0.0.1:…` for all of them; GAMMA-9),
+so one tailnet member can hold first contact shut; admitting by name and key
+ahead (`dyn admit --name N --key K`) cannot be blocked.
+
 **Open first contact can be flooded.** Someone holding many addresses (16
 IPv4 addresses, or 16 IPv6 sites) can keep every pending slot filled, and
 each newcomer is refused `pending_full`; behind one shared address (a NAT,
