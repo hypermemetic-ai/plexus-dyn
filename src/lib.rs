@@ -1258,7 +1258,7 @@ impl DynActivation {
     /// Connect the service at `url` (a WebSocket) as the peer `name`; a taken
     /// name is refused unless `replace`. `wss://` anywhere, `ws://` only to
     /// loopback (`refused`, `insecure_transport`); its identity is pinned.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     ///
     /// `expecting` (NEST-16): an interface hash, a contract's stamp — the
     /// peer must serve exactly that interface, now and at every remount.
@@ -1272,7 +1272,7 @@ impl DynActivation {
     /// Grow a dendrite: `source` (its `index.ts`) served as the peer `name`,
     /// its clients grown toward `targets` (other peers, `weather` or
     /// `weather.forecasts`, each called back through this service).
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     ///
     /// `expecting` (NEST-16): as `connect`'s.
     pub async fn grow(&self, name: String, source: String, targets: Vec<String>, replace: Option<bool>, expecting: Option<String>) -> DynEvent {
@@ -1293,7 +1293,7 @@ impl DynActivation {
     }
 
     /// Let go of the peer `name` (a dendrite's process ends with its last call).
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn disconnect(&self, name: String) -> DynEvent {
         let gone = self.inner.peers.lock().unwrap().remove(&name);
         match gone {
@@ -1310,7 +1310,7 @@ impl DynActivation {
     /// its declared needs it may call back up through this service, each
     /// `method` or `method@scope`; `callers`: the roles whose holders may
     /// call into it. Replaces what it held; empty lists withdraw it.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn consent(&self, peer: String, needs: Option<Vec<String>>, callers: Option<Vec<String>>) -> DynEvent {
         match self.set_consent(&peer, needs.unwrap_or_default(), callers.unwrap_or_default()) {
             Ok(c) => DynEvent::Consented { peer, needs: c.needs, callers: c.callers },
@@ -1329,7 +1329,7 @@ impl DynActivation {
     /// token minted), every call it is making back ends, its consent goes;
     /// listed as revoked until it is connected or grown again with
     /// `replace`. Tokens already issued expire within 60 s.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn revoke(&self, peer: String, why: Option<String>) -> DynEvent {
         let why = why.unwrap_or_else(|| "revoked by an admin".into());
         match self.revoke_peer(&peer, &why) {
@@ -1340,7 +1340,7 @@ impl DynActivation {
 
     /// DYNAUTH-7: rotate the signing key: a new one signs from now, the old
     /// one stays in `dyn.jwks` for one token lifetime, then goes.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn rotate_key(&self) -> DynEvent {
         match self.rotate_signing_key() {
             Ok((kid, previous)) => DynEvent::Rotated { kid, previous },
@@ -1388,7 +1388,7 @@ impl DynActivation {
     /// (`identity_changed`) — only when `fingerprint` is exactly that
     /// identity's (`dyn.pins`' `presented_fingerprint`, checked against the
     /// peer's own word), so nobody re-pins blind — and mount it again.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn repin(&self, name: String, fingerprint: String) -> DynEvent {
         self.repin_peer(&name, &fingerprint).await
     }
