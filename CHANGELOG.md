@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0] — unreleased
+
+DYNAUTH-31 (breaking only in that `PeerKind` gains a variant): **an
+in-process peer.** `DynActivation::attach(name, by, peer, replace)` holds
+any plexus-core `Peer` served in this process (plexus-bridge's bridges) in
+dyn's table as `dyn.peer.<name>` — `PeerKind::InProcess { by }`, listed by
+`dyn.peers` as `kind: in_process` — and `DynActivation::detach(name, &peer)`
+lets go of it (only that very peer). It is gated as every peer, called with
+the caller's own context, and **needs no key proof and no forwarded token**:
+dyn mints it nothing, and it is never an exchange's presenter or audience
+(both are found by key), so no token addressed to another peer is obtained
+through it — the rule written beside KEEL-19's in README "An in-process
+peer needs no key proof and no forwarded token". `dyn.revoke` refuses its
+next call and ends every call open into it with one error item saying why;
+the revocation stands when it is attached again and ends only with
+`replace`. `dyn.disconnect` ends its open calls too. `dyn.consent` gives it
+`callers` only (it declares no needs). Not served at the top level.
+`DynActivation::get` answers `Unavailable` for an in-process name (it is not
+a mount); a `--peers` entry naming one is skipped.
+
+**Moving from 0.2.1:** a `match` on `PeerKind` takes `InProcess { by }`.
+Nothing else changes.
+
 ## [0.2.1]
 
 On plexus-core 0.11.1.
