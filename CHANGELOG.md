@@ -8,7 +8,47 @@ KEEL-51: tests only (the fix is plexus-core's, its next release after
 refused it too through a dialed peer whose need is consented and whose
 callers are the viewers; `keel51_an_in_process_peer_is_handed_the_sessions_ceiling`
 — an in-process peer is handed the caller's ceiling, so its own call as that
-caller is refused as the caller's is. Both red against plexus-core 0.11.2.
+caller is refused as the caller's is. NEST-25's
+`a_dial_in_peers_calls_back_keep_the_rules_of_a_dialed_peers` now asserts the
+capped admin refused through a dial-in peer's call back (it pinned the bug),
+and a call back made after the sign-in's `expires_at` refused, for a dial-in
+and a dialed peer (`Restock::later`). All red against plexus-core 0.11.2.
+
+## [0.4.0] — unreleased
+
+NEST-25: **a node that dials in.** A service with no listening port opens a
+socket to the host, proves its key and offers an activation; once its key is
+admitted for its name it is `dyn.peer.<name>` while the socket lives —
+`PeerKind::DialIn { principal, since, from }` (`kind: dial_in`), gated,
+consented by its key, revoked (its socket closed, its next offer refused)
+and disconnected (its socket closed, its admission kept) as every peer.
+`DynActivation::dial_in()` opens the door (`DialIn::socket` for each
+accepted socket; `DialIn::host_key`, the dial key the node pins); new
+methods `dyn.admit { name?, key?, code? }`, `dyn.refuse { name?, key?,
+code?, why? }` and `dyn.pending` (all `everywhere`, operators only); new
+`DynEvent::Admitted` and `DynEvent::KeyRefused`; `DynOptions::
+dial_in_pending_max` (16), `dial_in_pending_per_address` (4),
+`dial_in_pending_age` (10 min); `consent.json` keeps `admitted` and
+`refused_keys`. An offer from a key not admitted waits pending (nothing
+mounted, the node told only its pairing code) until `dyn.admit --code`;
+first contact on the node's side (known hosts, the pairing code) is
+plexus-core's. Needs plexus-core with NEST-25's dial-in seams (0.11.3).
+`examples/dial_shop.rs`: a shop dialing in. README "A node that dials in".
+
+Review round 1: offers going pending are rate limited by address (an IPv4
+address, an IPv6 /64) and by key (`DynOptions::dial_in_offers_per_minute_
+per_address` 10, `…_per_key` 3); an address past its share supersedes its
+own oldest, and a full list takes the oldest of its busiest address. `dyn
+admit --name --key` is refused while an offer under that name or key waits
+with a pairing code. A mount re-checks admission, refusal and revocation
+under the store's lock as it enters the table (a refusal racing it wins).
+`DialIn::names`. Needs plexus-core's `Admission::mounted -> Result`.
+
+Review round 2: `dyn admit --name --key` is refused only while an offer of
+that key waits with a code; another key's offer under the name is let go
+`name_taken`. A full list is shared by site (an IPv6 /56). README: open first
+contact can be flooded, and admission ahead is the way that cannot be
+blocked; a node needs plexus-core 0.11.3 or later.
 
 ## [0.3.0] — unreleased
 

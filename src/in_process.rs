@@ -201,12 +201,16 @@ impl DynActivation {
             if peers.contains_key(name) && !replace {
                 return DynEvent::Error { message: format!("a peer is connected as `{name}`: disconnect it, or attach with `replace`") };
             }
-            let entry = Entry { kind: PeerKind::InProcess { by: by.to_string() }, child: None, local: Some(local), why: None, remounts: 0, expecting: None, pin: None, presented: None };
+            let entry = Entry { kind: PeerKind::InProcess { by: by.to_string() }, child: None, local: Some(local), why: None, remounts: 0, expecting: None, pin: None, presented: None, dial: None };
             peers.insert(name.to_string(), entry)
         };
         let replaced = old.is_some();
         if let Some(l) = old.as_ref().and_then(|e| e.local.as_ref()) {
             l.stop("replaced");
+        }
+        // NEST-25: a dialed-in node it replaces is let go.
+        if let Some(d) = old.as_ref().and_then(|e| e.dial.as_ref()) {
+            d.close("replaced");
         }
         // A mount it replaces may have been served at the top level; this is not.
         self.unsurface(name);

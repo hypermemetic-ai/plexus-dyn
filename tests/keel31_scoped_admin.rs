@@ -76,6 +76,10 @@ fn admin_calls() -> Vec<(&'static str, Value)> {
         ("dyn.revoke", json!({ "peer": "x" })),
         ("dyn.rotate_key", json!({})),
         ("dyn.repin", json!({ "name": "x", "fingerprint": "00" })),
+        // NEST-25 (review): who may dial in is the whole service's.
+        ("dyn.admit", json!({ "name": "x", "key": "key:abababababababababababababababababababababababababababababababab" })),
+        ("dyn.refuse", json!({ "name": "x" })),
+        ("dyn.pending", json!({})),
     ]
 }
 

@@ -122,6 +122,14 @@ pub(crate) struct Store {
     /// DYNAUTH-7: revoked peers, and why.
     #[serde(default)]
     pub revoked: BTreeMap<String, String>,
+    /// NEST-25: who may dial in — each name and the key admitted for it
+    /// (ssh's authorized_keys).
+    #[serde(default)]
+    pub admitted: BTreeMap<String, String>,
+    /// NEST-25: keys refused (`dyn.refuse`), and why: refused at once, never
+    /// held pending again, until admitted.
+    #[serde(default)]
+    pub refused_keys: BTreeMap<String, String>,
 }
 
 impl Store {
