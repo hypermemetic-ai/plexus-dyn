@@ -1,4 +1,4 @@
-//! KEEL-31 — dyn's admin methods act on the whole service (they run code
+//! KEEL-31 — dyn's admin methods (and its service-wide reads) act on the whole service (they run code
 //! on the host, change who it trusts, rotate its key): each declares
 //! `#[plexus_macros::method(everywhere)]`, so the gate admits it only where
 //! its grant is held on `*`. An admin of one ticket or organization, and a
@@ -116,5 +116,36 @@ async fn an_admin_of_everywhere_is_admitted_and_the_schema_says_why() {
         .filter(|m| m["everywhere"] == json!(true))
         .map(|m| m["name"].as_str().unwrap())
         .collect();
-    assert_eq!(everywhere, ["connect", "grow", "disconnect", "consent", "revoke", "rotate_key", "repin"], "{schema}");
+    assert_eq!(everywhere, plexus_dyn::EVERYWHERE, "{schema}");
+}
+
+/// The reads of every peer, consent and pin are the whole service's too: a
+/// viewer on one scope is refused them; a viewer on `*` reads them.
+#[tokio::test]
+async fn a_scoped_viewer_reads_no_service_wide_list() {
+    let (host, _data) = host().await;
+    for method in ["dyn.peers", "dyn.names", "dyn.consents", "dyn.pins"] {
+        match host.route(method, json!({}), Some(&who(ADMIN, Some(&["viewer@MENGER-5"])))).await {
+            Err(PlexusError::Forbidden { .. }) => {}
+            Err(other) => panic!("{method}: refused, but not forbidden: {other}"),
+            Ok(_) => panic!("{method}: answered a viewer on MENGER-5"),
+        }
+        assert!(host.route(method, json!({}), Some(&who(ADMIN, Some(&["viewer@*"])))).await.is_ok(), "{method} as viewer@*");
+    }
+}
+
+/// KEEL-31 (N2): the backstop that does not depend on the macro — dyn
+/// refuses to start when a whole-service method lost its mark.
+#[tokio::test]
+async fn dyn_refuses_to_start_without_its_marks() {
+    use plexus_core::plexus::Activation;
+    let data = tempfile::tempdir().unwrap();
+    let dyn_ = DynActivation::new(DynOptions { data_dir: data.path().to_path_buf(), ..DynOptions::default() });
+    let mut schema = dyn_.plugin_schema();
+    assert!(plexus_core::plexus::require_everywhere(&schema, plexus_dyn::EVERYWHERE).is_ok());
+    for m in schema.methods.iter_mut().filter(|m| m.name == "grow") {
+        m.everywhere = false;
+    }
+    let why = plexus_core::plexus::require_everywhere(&schema, plexus_dyn::EVERYWHERE).unwrap_err();
+    assert!(why.contains("dyn.grow"), "{why}");
 }
