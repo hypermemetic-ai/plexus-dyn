@@ -60,6 +60,8 @@ pub(crate) struct Pending {
     socket: u64,
     /// The address it is counted under ([`address_group`]).
     group: String,
+    /// R2-1: the coarser one the full list is shared by (an IPv6 /56).
+    site: String,
     release: oneshot::Sender<Result<(), OfferRefused>>,
 }
 
@@ -85,6 +87,18 @@ pub(crate) fn address_group(from: Option<&str>) -> String {
             }
         },
         Err(_) => from.to_string(),
+    }
+}
+
+/// R2-1: the coarser group a full list is shared by — an IPv4 address as
+/// [`address_group`], an IPv6 one by its /56 (one site's many /64s).
+pub(crate) fn site_group(from: Option<&str>) -> String {
+    match from.and_then(|f| f.parse::<std::net::SocketAddr>().ok()).map(|a| a.ip()) {
+        Some(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/56", s[0], s[1], s[2], s[3] & 0xff00)
+        }
+        _ => address_group(from),
     }
 }
 
@@ -192,6 +206,7 @@ impl DynActivation {
             from: offer.from.clone(),
         };
         let here = address_group(offer.from.as_deref());
+        let site = site_group(offer.from.as_deref());
         {
             // Review M1: a rate an address and a key (each re-offer is a
             // fresh pairing code), in the last minute.
@@ -228,14 +243,17 @@ impl DynActivation {
                 }
             } else if pending.len() >= o.dial_in_pending_max {
                 // Full: the busiest address gives way, when it holds more than this one would.
-                let mut groups: BTreeMap<&str, usize> = BTreeMap::new();
+                // By site (an IPv6 /56): one site's many /64s are one share.
+                let mut sites: BTreeMap<&str, usize> = BTreeMap::new();
                 for p in pending.values() {
-                    *groups.entry(p.group.as_str()).or_default() += 1;
+                    *sites.entry(p.site.as_str()).or_default() += 1;
                 }
-                let busiest = groups.iter().max_by_key(|(_, n)| **n).map(|(g, n)| (g.to_string(), *n));
+                let busiest = sites.iter().max_by_key(|(_, n)| **n).map(|(g, n)| (g.to_string(), *n));
+                let at_site = pending.values().filter(|p| p.site == site).count();
                 match busiest {
-                    Some((g, n)) if g == here || n > count(&pending, &here) + 1 => {
-                        if let Some(p) = oldest_of(&pending, &g).and_then(|s| pending.remove(&s)) {
+                    Some((g, n)) if g == site || n > at_site + 1 => {
+                        let oldest = pending.values().filter(|p| p.site == g).map(|p| p.socket).min();
+                        if let Some(p) = oldest.and_then(|s| pending.remove(&s)) {
                             gone.push((p, "the list is full, and the address it came from holds the most"));
                         }
                     }
@@ -250,7 +268,7 @@ impl DynActivation {
             for (p, why) in gone {
                 let _ = p.release.send(Err(refused("superseded", why)));
             }
-            pending.insert(offer.socket, Pending { info, socket: offer.socket, group: here.clone(), release: tx });
+            pending.insert(offer.socket, Pending { info, socket: offer.socket, group: here.clone(), site, release: tx });
             rates.entry(by_address).or_default().push_back(now);
             rates.entry(by_key).or_default().push_back(now);
         }
@@ -310,8 +328,10 @@ impl DynActivation {
                 }
                 // Review M2: an offer that waits with a pairing code is admitted
                 // by that code — the one its node shows — never by name and key.
-                if let Some(p) = self.inner.pending.lock().unwrap().values().find(|p| p.info.code.is_some() && (p.info.name == name || p.info.principal == key)) {
-                    return DynEvent::Error { message: format!("an offer waits for `{}` with a pairing code: admit it with `--code` as its node shows it (dyn.pending), never by name and key", p.info.name) };
+                // R2-2: by the key only — another key's offer squatting the
+                // name never blocks admitting this key ahead of time.
+                if let Some(p) = self.inner.pending.lock().unwrap().values().find(|p| p.info.code.is_some() && p.info.principal == key) {
+                    return DynEvent::Error { message: format!("an offer of this key waits for `{}` with a pairing code: admit it with `--code` as its node shows it (dyn.pending), never by name and key", p.info.name) };
                 }
                 let socket = self.inner.pending.lock().unwrap().values().find(|p| p.info.principal == key && p.info.name == name).map(|p| p.socket);
                 (name.to_string(), key.to_string(), socket)
@@ -333,6 +353,15 @@ impl DynActivation {
             s.close("its name was admitted for another key");
         }
         let released = socket.and_then(|s| self.inner.pending.lock().unwrap().remove(&s)).map(|p| p.release.send(Ok(())).is_ok()).unwrap_or(false);
+        // R2-2: another key's offer waiting under the name is let go: the name is this key's now.
+        let squatters: Vec<Pending> = {
+            let mut pending = self.inner.pending.lock().unwrap();
+            let sockets: Vec<u64> = pending.iter().filter(|(_, p)| p.info.name == name && p.info.principal != key).map(|(s, _)| *s).collect();
+            sockets.into_iter().filter_map(|s| pending.remove(&s)).collect()
+        };
+        for p in squatters {
+            let _ = p.release.send(Err(refused("name_taken", format!("`{name}` was admitted for another key"))));
+        }
         tracing::warn!(target: "plexus::audit", peer = %name, %key, by_code = code.is_some(), released, "dyn admit (dial-in)");
         DynEvent::Admitted { name, key, released }
     }
@@ -540,5 +569,14 @@ mod tests {
         assert_eq!(address_group(Some("[2001:db8:1:2::1]:1")), address_group(Some("[2001:db8:1:2:ffff::9]:2")));
         assert_ne!(address_group(Some("[2001:db8:1:2::1]:1")), address_group(Some("[2001:db8:1:3::1]:1")));
         assert_eq!(address_group(Some("[::ffff:192.0.2.7]:1")), address_group(Some("192.0.2.7:1")));
+    }
+
+    /// Review R2-1: a full list is shared by site — an IPv6 /56 is one.
+    #[test]
+    fn a_full_list_counts_an_ipv6_site_by_its_56() {
+        use super::site_group;
+        assert_eq!(site_group(Some("[2001:db8:1:200::1]:1")), site_group(Some("[2001:db8:1:2ff::1]:1")));
+        assert_ne!(site_group(Some("[2001:db8:1:200::1]:1")), site_group(Some("[2001:db8:1:300::1]:1")));
+        assert_eq!(site_group(Some("192.0.2.7:1")), address_group(Some("192.0.2.7:9")));
     }
 }

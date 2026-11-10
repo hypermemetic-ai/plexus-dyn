@@ -329,7 +329,9 @@ running `dyn` and becomes a peer there: `dyn.peer.<name>` (`dyn.peers`
 says `kind: dial_in`, its `principal`, `since` and `from`), gated, consented
 and revoked as every peer, for as long as its socket lives.
 
-**What the node needs**: outbound only — one connection to the host's
+**What the node needs**: plexus-core 0.11.3 or later (its `DialOut` and
+`Exposed`: the pairing code, `possession`, first contact) — an older node's
+offer is refused `unauthenticated`. Outbound only — one connection to the host's
 socket (443 for `wss://`), nothing listening, no port forwarded. Its key
 file (0600), and the host's key: `--trust key:<hex>` (strict), or its
 known-hosts file at first contact. It dials again within its backoff
@@ -361,7 +363,7 @@ for the name it asks for:
 | more than 10 offers going pending from one address a minute, or 3 by one key (each re-offer is a fresh code) | refused `rate_limited` (`dial_in_offers_per_minute_per_*`) |
 | a second offer of one key | the older is superseded |
 | an address past its share (4 waiting) | that address's own oldest is superseded, nobody else's |
-| the list full (16) | the address holding the most gives its oldest, when it holds more than the newcomer's would; spread one an address, `pending_full` |
+| the list full (16) | the site holding the most (an IPv4 address, an IPv6 /56) gives its oldest, when it holds more than the newcomer's would; spread one a site, `pending_full` |
 | 10 minutes waiting | `pending_expired` |
 
 An address is an IPv4 address, or an IPv6 /64 (one site's), as the
@@ -370,6 +372,17 @@ address**: the per-address limits then see one address, and its share is
 everyone's — a known limit; dyn reads no forwarded header (there is no
 trusted-proxy setting here). Admitted keys are never held to any of this:
 an admitted node is mounted, not pended.
+
+**Open first contact can be flooded.** Someone holding many addresses (16
+IPv4 addresses, or 16 IPv6 sites) can keep every pending slot filled, and
+each newcomer is refused `pending_full`; behind one shared address (a NAT,
+a proxy) a few offers push an honest one out. The way in that cannot be
+blocked is to **admit the name and key ahead of time** — `dyn admit --name
+N --key K`, the key learned from the node's owner by another channel: an
+admitted key is mounted at once, whatever waits, and another key's offer
+waiting under that name is let go (`name_taken`), never the reason an
+admission is refused. (`--name --key` is refused only while an offer of *that
+key* waits with a code: then admit it by the code.)
 
 Admissions and refused keys are kept in `consent.json` with the consents.
 `dyn revoke` closes its socket and refuses it until admitted again;

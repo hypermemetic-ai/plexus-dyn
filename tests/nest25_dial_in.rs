@@ -577,8 +577,8 @@ async fn admit_by_key_is_refused_while_an_offer_with_a_code_waits() {
     let mut ws = offer_from(&host, 91, "shop", "127.0.0.13").await;
     assert_eq!(answered_within(&mut ws, 300).await, None);
     let code = host.dyn_.pending_list()[0].code.clone().unwrap();
-    // By name and key: refused — the code is how this offer is admitted.
-    for args in [json!({ "name": "shop", "key": me }), json!({ "name": "other", "key": me }), json!({ "name": "shop", "key": "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })] {
+    // Its key by name and key: refused — the code is how this offer is admitted.
+    for args in [json!({ "name": "shop", "key": me }), json!({ "name": "other", "key": me })] {
         let said = admit(&host, args.clone()).await;
         assert_eq!(said[0]["type"], "error", "{args}: {said:?}");
         assert!(said[0]["message"].as_str().unwrap().contains("--code"), "{said:?}");
@@ -587,6 +587,24 @@ async fn admit_by_key_is_refused_while_an_offer_with_a_code_waits() {
     // By its code: admitted.
     let said = admit(&host, json!({ "code": code })).await;
     assert_eq!(said[0]["type"], "admitted", "{said:?}");
+}
+
+/// Review R2-2: a stranger's coded offer squatting a name does not stop the
+/// operator admitting the honest key for it ahead of time — the way in that
+/// flooding cannot block; the squatter's offer is let go `name_taken`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_squatters_coded_offer_does_not_block_admitting_the_honest_key_ahead() {
+    let dir = tempfile::tempdir().unwrap();
+    let (k, honest) = key(dir.path(), "shop", 93);
+    let host = host().await;
+    let mut squat = offer_from(&host, 94, "shop", "127.0.0.14").await;
+    assert_eq!(answered_within(&mut squat, 300).await, None, "the squatter waits");
+    let said = admit(&host, json!({ "name": "shop", "key": honest })).await;
+    assert_eq!(said[0]["type"], "admitted", "{said:?}");
+    assert_eq!(kind_of(&answered_within(&mut squat, 2000).await).as_deref(), Some("name_taken"));
+    assert!(host.dyn_.pending_list().is_empty());
+    let a = node(&host, "shop", &k);
+    a.mounted(Duration::from_secs(10)).await.unwrap();
 }
 
 /// Review L1: an operator refusing a key while its node is between the
@@ -709,6 +727,11 @@ async fn a_dial_in_peers_calls_back_keep_the_rules_of_a_dialed_peers() {
     assert_eq!(dialed_in[0], ("admin sneak".to_string(), false));
     assert_eq!(dialed_in[1], ("viewer low".to_string(), false));
     assert_eq!(dialed_in[3], ("admin low".to_string(), true));
+    // KEEL-51 (a session ceiling dropped on every peer's call back, dialed
+    // ones too, plexus-core): today a session ceilinged to viewer reaches
+    // `shop.items` through the call back. This asserts the bug as it stands,
+    // so it fails the day KEEL-51 lands — then flip it to `false`.
+    assert_eq!(dialed_in[2], ("admin ceilinged to viewer low".to_string(), true), "KEEL-51 landed? flip this row to false");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

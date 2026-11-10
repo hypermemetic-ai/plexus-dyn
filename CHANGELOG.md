@@ -30,6 +30,12 @@ with a pairing code. A mount re-checks admission, refusal and revocation
 under the store's lock as it enters the table (a refusal racing it wins).
 `DialIn::names`. Needs plexus-core's `Admission::mounted -> Result`.
 
+Review round 2: `dyn admit --name --key` is refused only while an offer of
+that key waits with a code; another key's offer under the name is let go
+`name_taken`. A full list is shared by site (an IPv6 /56). README: open first
+contact can be flooded, and admission ahead is the way that cannot be
+blocked; a node needs plexus-core 0.11.3 or later.
+
 ## [0.3.0] — unreleased
 
 DYNAUTH-31 (breaking only in that `PeerKind` gains a variant): **an
