@@ -437,8 +437,19 @@ where
     })
 }
 
+/// The principal `dyn`'s mounts act as (`ChildOptions::for_service("dyn")`).
+const DYN: &str = "service:dyn";
+
+/// KEEL-19: a keyed peer is served on a connection proven as its sender —
+/// never a `Pipe` (refused). The stand-in WebSocket server proves nothing
+/// itself; the only one that dials it is `dyn`, so it stands for a
+/// transport that proved `dyn`'s principal.
+fn proven_dyn() -> plexus_core::plexus::remote_child::ChildPeer {
+    plexus_core::plexus::remote_child::ChildPeer::connection(DYN, [DYN.to_string()])
+}
+
 fn keyed(key: &plexus_core::plexus::peer_token::PeerKey) -> plexus_core::plexus::remote_child::ServeChild {
-    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), ..Default::default() }
+    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), peer: proven_dyn(), tokens: None }
 }
 
 /// A viewer reaches a peer once an admin consents to its role calling it;
@@ -531,7 +542,7 @@ async fn a_peer_whose_key_changed_is_refused_at_remount() {
 /// A far side that verifies: its key, and the host's JWKS trusted.
 fn verifying(key: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core::plexus::peer_token::Jwks) -> plexus_core::plexus::remote_child::ServeChild {
     let v = plexus_core::plexus::peer_token::Verifier::new(key.kid(), jwks).unwrap();
-    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), tokens: Some(Arc::new(v)), ..Default::default() }
+    plexus_core::plexus::remote_child::ServeChild { key: Some(key.clone()), tokens: Some(Arc::new(v)), peer: proven_dyn() }
 }
 
 /// A far side that verifies takes a call by the token `dyn` minted for it;
@@ -552,9 +563,10 @@ async fn a_verifying_peer_takes_a_call_by_its_token() {
     // An anonymous caller is never forwarded (the gate), so no token is
     // minted without a `sub`.
     peer_task.abort();
-    // A peer trusting another issuer refuses this one's tokens.
+    // A peer trusting another issuer refuses this one's tokens. (KEEL-19:
+    // a key of its own — `v`'s is `v`'s alone here.)
     let port = free_port();
-    let stranger = keyed_peer(port, verifying(&key, &Jwks { keys: vec![PeerKey::generate().jwk()] })).await;
+    let stranger = keyed_peer(port, verifying(&PeerKey::generate(), &Jwks { keys: vec![PeerKey::generate().jwk()] })).await;
     call(&r, ADMIN, "dyn.connect", json!({ "name": "s", "url": format!("ws://127.0.0.1:{port}") })).await;
     let refused = call(&r, USER, "dyn.peer.s.forecast", json!({ "city": "oslo" })).await;
     assert!(refused[0]["message"].as_str().is_some_and(|m| m.contains("token is refused") && m.contains("not trusted")), "{refused:?}");
@@ -598,6 +610,13 @@ impl RelayActivation {
     #[plexus_macros::method]
     pub async fn sneak(&self) -> Value {
         up("dyn", "grow", json!({ "name": "x", "source": "", "targets": [] })).await
+    }
+    /// KEEL-19 (N2): what the host's peer `t` says, asked after a moment —
+    /// while consent may move under the call.
+    #[plexus_macros::method(uses("dyn.peer.t.claims"))]
+    pub async fn later(&self) -> Value {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        up_first("dyn.peer.t", "claims", json!({})).await
     }
     /// KEEL-19: this call's token and its claims (test only: a peer never
     /// hands its token out) — what relay exchanges with `dyn.exchange`.
@@ -883,6 +902,56 @@ async fn keel19_a_revoked_presenter_is_refused_at_once() {
     let got = p.exchange(&held, &proof_held).await;
     assert!(got["message"].as_str().is_some_and(|m| m.contains("[revoked]") && m.contains("compromised")), "{got:?}");
     p.end();
+}
+
+/// KEEL-19 (N2): a consent narrowed while a forwarded call is open narrows
+/// the next call back made under it — the token minted before (held `*`)
+/// no longer decides alone: the call back is held to what consent allows
+/// now, `MENGER` — its ceiling, and so the token minted onward for `t`,
+/// holds `MENGER` alone (this rig's gate resolves every target everywhere,
+/// so the narrowed call is admitted, and narrowed).
+async fn keel19_a_narrowed_consent_holds_an_open_call() {
+    let p = pair(true).await;
+    let r = Arc::clone(&p.r.host);
+    let open = tokio::spawn({
+        let r = Arc::clone(&r);
+        async move { items(r.route("dyn.peer.relay.later", json!({}), Some(&who(USER))).await).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let c = call(&p.r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims@MENGER"] })).await;
+    assert_eq!(c[0]["type"], "consented", "{c:?}");
+    let got = open.await.unwrap();
+    assert_eq!(got[0]["claims"]["scope"], "tell.claims@MENGER", "the call back went through on the token's `*`: {got:?}");
+    // Consented everywhere again: the next call reaches t.
+    call(&p.r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims"] })).await;
+    let got = call(&p.r, USER, "dyn.peer.relay.ask", json!({})).await;
+    assert_eq!(got[0]["claims"]["scope"], "tell.claims@*", "{got:?}");
+    p.end();
+}
+
+/// KEEL-19 (c): a peer proving a key another peer here holds is refused —
+/// typed (`key_in_use`) and audited — so a token addressed to a key, and an
+/// exchange's presenter found by its key, name one peer.
+async fn keel19_a_key_is_mounted_once() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let r = rig().await;
+    let k = PeerKey::generate();
+    let (p1, p2) = (free_port(), free_port());
+    let one = keyed_peer(p1, keyed(&k)).await;
+    let two = keyed_peer(p2, keyed(&k)).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "a", "url": format!("ws://127.0.0.1:{p1}") })).await;
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "b", "url": format!("ws://127.0.0.1:{p2}") })).await;
+    assert_eq!(got[0]["type"], "refused", "{got:?}");
+    assert_eq!(got[0]["reason"], "key_in_use", "{got:?}");
+    let log = String::from_utf8_lossy(&AUDIT_LOG.lock().unwrap()).to_string();
+    assert!(log.contains("its key is another peer's"), "audited");
+    // Revoked, its key still is not another's way in.
+    call(&r, ADMIN, "dyn.revoke", json!({ "peer": "a", "why": "compromised" })).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "b", "url": format!("ws://127.0.0.1:{p2}") })).await;
+    assert_eq!(got[0]["reason"], "key_in_use", "{got:?}");
+    one.abort();
+    two.abort();
 }
 
 // ------------------------------------------------------------------ DYNAUTH-7
@@ -1720,8 +1789,11 @@ fn main() {
     std::env::set_var(PASSED_ENV, "given");
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     rt.block_on(async {
+        // KEEL-19: `cargo test --test dyn -- NAME` (or `DYN_TEST=NAME`) runs
+        // only the rows whose name holds NAME — one row alone, to see it red.
+        let only: Option<String> = std::env::args().skip(1).find(|a| !a.starts_with('-')).or_else(|| std::env::var("DYN_TEST").ok());
         macro_rules! run {
-            ($($t:ident),*) => {{ let mut n = 0; $( $t().await; println!("test {} ... ok", stringify!($t)); n += 1; )* n }};
+            ($($t:ident),*) => {{ let mut n = 0; $( if only.as_deref().is_none_or(|f| stringify!($t).contains(f)) { $t().await; println!("test {} ... ok", stringify!($t)); n += 1; } )* n }};
         }
         let n = run!(
             connect_call_disconnect,
@@ -1750,6 +1822,8 @@ fn main() {
             keel19_a_consented_peer_reaches_another_with_its_proof,
             keel19_a_subject_is_exchanged_once,
             keel19_a_revoked_presenter_is_refused_at_once,
+            keel19_a_narrowed_consent_holds_an_open_call,
+            keel19_a_key_is_mounted_once,
             a_revoked_peer_is_refused_and_its_tokens_expire,
             every_hop_is_audited_without_a_secret,
             the_signing_key_rotates,

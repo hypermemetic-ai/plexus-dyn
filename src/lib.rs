@@ -344,6 +344,24 @@ pub enum Refusal {
     FingerprintMismatch,
     /// NEST-21: `dyn.repin` on a peer that presented nothing refused.
     NotPresented,
+    /// KEEL-19: it proved a key another peer here already holds — one key,
+    /// one mount.
+    KeyInUse,
+}
+
+/// KEEL-19: the peer other than `name` that holds `key` — mounted under it,
+/// or pinned to it — if one does. One key is one mount: a token addressed to
+/// a key, and an exchange's presenter found by its key, name one peer.
+fn key_held_by(peers: &BTreeMap<String, Entry>, name: &str, key: Option<&str>) -> Option<String> {
+    let key = key?;
+    peers
+        .iter()
+        .find(|(n, e)| n.as_str() != name && (e.child.as_ref().and_then(|c| c.peer_key()) == Some(key) || e.pin.as_ref().and_then(|p| p.key.as_deref()) == Some(key)))
+        .map(|(n, _)| n.clone())
+}
+
+fn key_in_use(name: &str, key: &str, other: &str) -> String {
+    format!("`{name}` proved the key {key}, which `{other}` holds here: one key is one peer (disconnect `{other}` first)")
 }
 
 /// DYNAUTH-6: what `dyn.exchange` answers (RFC 8693 §2.2's response, as
@@ -1011,6 +1029,15 @@ impl DynActivation {
         };
         let repin_on_valid_cert = self.config().get(&settings::DYN_REPIN_ON_VALID_CERT);
         let mut peers = self.inner.peers.lock().unwrap();
+        // KEEL-19: one key, one mount.
+        let mounted = mounted.and_then(|child| match key_held_by(&peers, name, child.peer_key()) {
+            Some(other) => {
+                let why = key_in_use(name, child.peer_key().unwrap_or_default(), &other);
+                tracing::warn!(target: "plexus::audit", peer = %name, holder = %other, key = %child.peer_key().unwrap_or_default(), "dyn refused a mount: its key is another peer's");
+                Err(why)
+            }
+            None => Ok(child),
+        });
         let Some(e) = peers.get_mut(name) else { return Err(format!("`{name}` was disconnected while it was mounted")) };
         match mounted {
             Ok(child) => {
@@ -1107,6 +1134,13 @@ impl DynActivation {
             Ok(child) => {
                 if let Err(message) = self.vet(&name, &child, expecting.as_deref()) {
                     return DynEvent::Error { message };
+                }
+                // KEEL-19: one key, one mount — refused, typed and audited.
+                let held = key_held_by(&self.inner.peers.lock().unwrap(), &name, child.peer_key());
+                if let Some(other) = held {
+                    let key = child.peer_key().unwrap_or_default().to_string();
+                    tracing::warn!(target: "plexus::audit", peer = %name, holder = %other, %key, "dyn refused a mount: its key is another peer's");
+                    return DynEvent::Refused { reason: Refusal::KeyInUse, message: key_in_use(&name, &key, &other), old: None, presented: child.identity().map(PeerIdentity::from) };
                 }
                 let schema = plexus_core::plexus::Activation::plugin_schema(&child);
                 let interface = interface_of(&child);

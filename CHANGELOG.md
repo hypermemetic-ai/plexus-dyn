@@ -20,6 +20,17 @@ message names its reason in brackets (`[not_consented]`, `[presenter]`,
 `[revoked]`, `[again]`, `[proof]`, `[subject]`, `[audience]`) and is
 audited (`plexus::audit`). A revoked presenter is refused at once.
 
+Second pass: **a key is mounted once.** A peer proving a key another peer
+here holds (mounted, or pinned) is refused — `refused` with
+`Refusal::KeyInUse` (new: breaking for an exhaustive match), audited — at
+`connect`/`grow` and at a remount; so a token addressed to a key, and an
+exchange's presenter found by its key, name one peer, and a revoked peer's
+key gets no sibling mount. With plexus-core 0.11.1 a keyed peer is served on
+`ChildPeer::connection` (the tests' WebSocket peers are served as proven
+`service:dyn`), every forwarded hop carries the service's proof, and a
+consent narrowed under an open call narrows its next call back. Both sides
+upgrade together (plexus-core's CHANGELOG).
+
 ## [0.2.0] — unreleased
 
 On plexus-core, plexus-macros and plexus-client 0.11 (NEST-24): a new minor,

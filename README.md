@@ -127,7 +127,11 @@ proves at `_info` (a nonce signed; plexus-core's `ServeChild::key` on the
 far side) — pinned with its identity, so a remount proving another key is
 refused (`identity_changed`) until `connect … replace` — and the `needs` its
 schema declares. A dendrite on its pipe proves no key: the pipe is the
-host's own.
+host's own. KEEL-19: the proof is made for its asker — the principal the
+peer's connection proved (a keyed peer is served on plexus-core's
+`ChildPeer::connection`, never a `Pipe`) — so a proof one peer asks of
+another and relays is refused; and one key is one peer: a peer proving a
+key another peer here holds is refused `key_in_use`.
 
 Declared needs are a request. Until an admin answers it with `dyn.consent`
 every one is refused upward (`forbidden`, `not_needed`, "no admin has
@@ -150,7 +154,9 @@ peer's consented needs within the call's reach, `call` and `method` the
 forwarded call, `jti`, at most 60 s. A dendrite on its pipe gets one too,
 addressed `pipe:<name>` and bound to no key. A peer verifies with
 `dyn.jwks` (plexus-core's `Verifier`, `ServeChild::tokens`): the algorithm
-pinned, the audience its own, fresh, each `jti` once. Calling back under a
+pinned, the audience its own, fresh, each `jti` once — and, KEEL-19, sent
+with the service's proof that it sends it (`hop.proof`, by the key that
+signed the token), over a connection proven as the service. Calling back under a
 key-bound token, a peer sends a proof of possession by its key for that
 method and call (plexus-core's `host()` does it); without one it is
 refused. The signing key is `<data-dir>/dyn.key` (0600), denied to every
