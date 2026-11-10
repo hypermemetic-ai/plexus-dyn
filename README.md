@@ -262,11 +262,13 @@ read through a symbolic link.
 
 A child dial's key proof is spec/00's one form, signed as the reserved agent
 `plexus.child-dial` (`CHILD_DIAL_AGENT`; `agent` is in the signed bytes): a
-child takes only that agent, and plexus-auth-core's `KeyProofAdapter`
-(0.3.2) refuses it as a sign-in. So a dial's proof captured cannot be
-replayed as a sign-in to a service at that URL, nor a sign-in proof as a
-dial. A context of its own would be a plexus-wire spec/00 change, not
-made.
+child takes only that agent, so a sign-in proof replayed to a child at
+the same URL is refused. A server's sign-in (plexus-auth-core's
+`KeyProofAdapter`) takes a dial proof as the dialing key's sign-in, by
+design: a dial proof is addressed to the dialed URL and usable only there,
+and it is how a service mounts another service behind key sign-in
+(`--child far=wss://…`, `dyn.connect`). A context of its own would be a
+plexus-wire spec/00 change, not made.
 
 ## Onward calls (DYNAUTH-6)
 

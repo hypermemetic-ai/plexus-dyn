@@ -64,7 +64,9 @@ Fifth pass: `dyn` dials its peers as the reserved agent
 dial: upgrade `dyn` and its keyed peers together. A peer's upgrade ledger
 refuses when full (4096 proofs a minute) instead of evicting. The example
 prints the dial principal at start (`dial principal: key:…`), which each
-keyed peer trusts. Requires plexus-auth-core 0.3.2 and plexus-macros 0.11.1.
+keyed peer trusts. Requires plexus-macros 0.11.1 (plexus-auth-core stays
+0.3.1). A service behind key sign-in is mounted as before: its sign-in
+takes the dial proof as `dyn`'s key.
 
 **Moving from 0.2.0:** upgrade with plexus-core 0.11.1 on both sides; give
 each keyed peer `dial_principal()` to trust and serve it with
