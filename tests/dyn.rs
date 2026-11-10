@@ -2157,6 +2157,7 @@ async fn dynauth31_a_consent_is_its_holders_not_its_names() {
     let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "p", "url": format!("ws://127.0.0.1:{port}"), "replace": true })).await;
     assert_eq!(got[0]["type"], "connected", "{got:?}");
     assert!(!viewer_admitted(&r, "dyn.peer.p.weather.forecast", json!({ "city": "oslo" })).await, "a keyless peer inherited an in-process peer's consent");
+    assert!(!consented_names(&r).contains(&"p".to_string()), "the in-process peer's consent is still kept for the name");
     // And the reverse: an in-process peer over a keyless one's name.
     let c = call(&r, ADMIN, "dyn.consent", json!({ "peer": "p", "callers": ["viewer"] })).await;
     assert_eq!(c[0]["type"], "consented", "{c:?}");
