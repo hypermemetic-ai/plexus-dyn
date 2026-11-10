@@ -590,6 +590,13 @@ impl consent::ConsentSource for Inner {
                 (None, Some(local)) if c.is_for(None, Some(&local.holder())) => in_process::method_paths(local),
                 _ => continue,
             };
+            // GAMMA-11: the peer's own path too — no method is named it, so it
+            // admits no call; it is what plexus-core's introspection reads
+            // (KEEL-32: `dyn.peer.<name>.schema` is routed only for a caller
+            // holding a grant at the path or in the slot's static index, which
+            // a peer's methods, held by consent, are not), so a consented
+            // caller reads the schema of what it may call.
+            out.push(format!("dyn.peer.{name}"));
             for m in paths {
                 out.push(format!("dyn.peer.{name}.{m}"));
                 if top.contains(name) {
