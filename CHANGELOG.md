@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.0] — unreleased
+
+NEST-25: **a node that dials in.** A service with no listening port opens a
+socket to the host, proves its key and offers an activation; once its key is
+admitted for its name it is `dyn.peer.<name>` while the socket lives —
+`PeerKind::DialIn { principal, since, from }` (`kind: dial_in`), gated,
+consented by its key, revoked (its socket closed, its next offer refused)
+and disconnected (its socket closed, its admission kept) as every peer.
+`DynActivation::dial_in()` opens the door (`DialIn::socket` for each
+accepted socket; `DialIn::host_key`, the dial key the node pins); new
+methods `dyn.admit { name?, key?, code? }`, `dyn.refuse { name?, key?,
+code?, why? }` and `dyn.pending` (all `everywhere`, operators only); new
+`DynEvent::Admitted` and `DynEvent::KeyRefused`; `DynOptions::
+dial_in_pending_max` (16), `dial_in_pending_per_address` (4),
+`dial_in_pending_age` (10 min); `consent.json` keeps `admitted` and
+`refused_keys`. An offer from a key not admitted waits pending (nothing
+mounted, the node told only its pairing code) until `dyn.admit --code`;
+first contact on the node's side (known hosts, the pairing code) is
+plexus-core's. Needs plexus-core with NEST-25's dial-in seams (0.11.3).
+`examples/dial_shop.rs`: a shop dialing in. README "A node that dials in".
+
 ## [0.3.0] — unreleased
 
 DYNAUTH-31 (breaking only in that `PeerKind` gains a variant): **an

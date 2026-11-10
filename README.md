@@ -9,7 +9,7 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.connect { name, url, replace?, expecting? }` | admin | a service on a WebSocket, mounted as the peer `name` (a taken name refused unless `replace`); `expecting` an interface hash (a contract's stamp) it must serve, at connect and every remount (NEST-16) |
 | `dyn.grow { name, source, targets, replace?, expecting? }` | admin | `source` written to `<data-dir>/<name>/index.ts` and served by `plexus-dendrite serve DIR --via-host …`; each target (`w` or `w.weather`, a peer's path) is grown from the host's view of `dyn.peer.<target>` and called back **through the host** |
 | `dyn.disconnect { name }` | admin | let go |
-| `dyn.peers` | viewer | each peer: kind (`ws` / `dendrite` / `in_process`, DYNAUTH-31), up, why down, interface hash, restarts, open calls, calls, calls back, remounts |
+| `dyn.peers` | viewer | each peer: kind (`ws` / `dendrite` / `in_process`, DYNAUTH-31 / `dial_in`, NEST-25), up, why down, interface hash, restarts, open calls, calls, calls back, remounts |
 | `dyn.names` | viewer | each peer's name — the slot's list |
 | `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
 | `dyn.jwks` | public | DYNAUTH-12: the JWK Set (Ed25519, `kid` = `key:<hex>`) a peer verifies this service's tokens with |
@@ -17,6 +17,9 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.revoke { peer, why? }` | admin | DYNAUTH-7: nothing forwarded to it from now (no token minted), its calls back end, its consent goes; listed revoked until connected or grown again with `replace` |
 | `dyn.rotate_key` | admin | DYNAUTH-7: a new signing key from now; the old one in `dyn.jwks` for one token lifetime |
 | `dyn.consents` | viewer | each peer's key (proved at `_info`), declared needs, consented needs and callers, what is pending |
+| `dyn.admit { name?, key?, code? }` | admin | NEST-25: let a node dial in — `code` the pending offer whose pairing code it is, or `key` for `name` ahead of time; lifts a refusal of the key and a revocation of the name |
+| `dyn.refuse { name?, key?, code?, why? }` | admin | NEST-25: turn a key away for good (until admitted): its admissions, pending offers and connections go |
+| `dyn.pending` | admin | NEST-25: the dial-in offers waiting: name, key, fingerprint, pairing code, since, address |
 | `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead, or be named by its consent's `callers` |
 
 **Grafts** (NEST-16): every connect, grow and remount reads the peer's
@@ -317,6 +320,96 @@ over the name since is not touched). It is called as
    a refresh), so a revoked or replaced peer acts for no one.
 
 It is not served at the service's top level (`top_level`).
+
+## A node that dials in (NEST-25)
+
+A service with no listening port — a laptop, a box behind a NAT or a
+firewall that takes no inbound connection — opens one WebSocket to a host
+running `dyn` and becomes a peer there: `dyn.peer.<name>` (`dyn.peers`
+says `kind: dial_in`, its `principal`, `since` and `from`), gated, consented
+and revoked as every peer, for as long as its socket lives.
+
+**What the node needs**: outbound only — one connection to the host's
+socket (443 for `wss://`), nothing listening, no port forwarded. Its key
+file (0600), and the host's key: `--trust key:<hex>` (strict), or its
+known-hosts file at first contact. It dials again within its backoff
+whenever the socket drops, and the host takes it back under the same name.
+
+```sh
+# the host (plexus-ui; any service that hands its sockets to DynActivation::dial_in)
+plexus-ui serve --admin key:<you> --dyn --dial-in
+# the node: an activation served over a dial-out (examples/dial_shop.rs)
+cargo run --example dial_shop -- --host wss://host.example/ws --key ~/.plexus/keys/shop.key --name shop
+```
+
+In code, one line: `Exposed::new(DialOut::new(url, key).trust(host_key).mount(name)).serve(activation)`
+— or, for first contact, `Exposed::new(DialOut::new(url, key).mount(name)).with_first_contact(known_hosts, ask)`.
+
+**Who may dial in** (ssh's `authorized_keys`): a key proven on its own
+connection — signed in with a key proof at the upgrade, and its offer
+signing the host's fresh nonce and its own — and admitted by an operator
+for the name it asks for:
+
+| the offer | then |
+| -- | -- |
+| its key admitted for the name (`dyn admit --name N --key K`) | its schema is asked, its `needs` checked (NEST-16), it is mounted |
+| its key not admitted | **pending**: nothing mounted, nothing served, the node told only "pending" and the pairing code; `dyn pending` (operators only) lists name, key, fingerprint, code, since, address; `dyn admit --code XXXX-XXXX` takes it, `dyn refuse --code …` turns it away |
+| a refused key (`dyn refuse`) | refused at once, never pending again, until admitted |
+| a revoked name (`dyn revoke`) | refused until admitted again |
+| a name another key, or another kind of peer, holds; a key another peer holds | refused before its schema is asked |
+| an anonymous socket, or one signed in any other way (a session cookie) | no hook at all: its offer is an unknown method, it learns nothing |
+| more than 16 pending, 4 from one address, a second of one key (the older is superseded), 10 minutes waiting | refused (`pending_full`, `superseded`, `pending_expired`; `DynOptions::dial_in_pending_*`) |
+
+Admissions and refused keys are kept in `consent.json` with the consents.
+`dyn revoke` closes its socket and refuses it until admitted again;
+`dyn disconnect` closes it and the admission stays (it comes back by
+dialing again); the socket's close takes it out of the table at once and
+ends every call open into it `child_unavailable`; the same key from a new
+socket takes the name over and the old socket is closed. Its consent is its
+key's; its calls back (a graft that knows its parent) are held to its
+declared and consented needs and run as the caller of the call they are
+made under, with a token bound to its key. It is not served at the top
+level. The host's limits are its transport's and its mounts': one name a
+key, `child.max_calls` calls open into it, `child.timeout` for its schema
+and each call to open, the socket pinged and closed when silent.
+
+**What the host trusts**: the node's key, proven twice — the upgrade's key
+proof (a signature over a fresh nonce, for this host's URL, used once) and
+its offer's `possession` (a signature over the host's key, the host's nonce,
+its own nonce, the service and the name). Nothing else about the node: what
+it serves is decided by the gate for every call into it, and what it calls
+back by its consent.
+
+**What the node trusts** (ssh's `known_hosts`): the host's key, proved at
+`_info {nonce}` (KEEL-8's proof, made for the node's key). `trust(key)` pins
+it; without it the node reads `$XDG_CONFIG_HOME/plexus/known_hosts`
+(`<url> key:<hex>`, 0600, never through a link). At **first contact** — no
+key there — the node shows the host's key, its fingerprint (`SHA256:…`) and
+the pairing code, and sends and serves nothing until someone says yes
+(`dial_shop`: a prompt; in code: the callback, which refuses unless it
+answers `true`); a yes pins it. A host presenting another key than the one
+pinned is refused (`host_key_changed`), loudly, and nobody is asked again.
+
+**The pairing code**: 8 base32 characters, `MMG4-2KLG` — the form of
+menger's pairing code (TETHER-12) — which both ends derive from both keys
+and both nonces of the connection (SHA-256 in the domain
+`plexus-dial-pairing/v1`). The node commits to its nonce at `_info` before
+it sees the host's, so nobody in the middle can choose keys to make two
+codes agree. The node prints it; `dyn pending` shows it; *does your
+terminal show EV76-M6TS?* — `dyn admit --code EV76-M6TS` admits the offer
+whose code it is (any case, dashes and spaces optional).
+
+What it protects against: a man in the middle at first contact who answers
+each side with a key of its own — the two codes differ, and an operator who
+compares them admits nothing (a try matches one time in 2⁴⁰, and each try is
+a pending offer someone sees). A middle that forwards the node's sign-in and
+swaps only the host's key is refused outright: the node's `possession` is
+signed over the key it was shown. What it does not protect against: an
+operator who admits without comparing the code, or a node owner who answers
+yes without looking; a host whose dial key was stolen; and anything on a
+plain `ws://` socket beyond loopback, where the calls themselves cross in
+clear — a real deployment is `wss://` (the host's certificate validated, or
+`--tls-roots`), the pairing code guarding the keys and TLS the channel.
 
 ## Onward calls (DYNAUTH-6)
 
