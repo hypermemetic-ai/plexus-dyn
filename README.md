@@ -9,7 +9,7 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.connect { name, url, replace?, expecting? }` | admin | a service on a WebSocket, mounted as the peer `name` (a taken name refused unless `replace`); `expecting` an interface hash (a contract's stamp) it must serve, at connect and every remount (NEST-16) |
 | `dyn.grow { name, source, targets, replace?, expecting? }` | admin | `source` written to `<data-dir>/<name>/index.ts` and served by `plexus-dendrite serve DIR --via-host …`; each target (`w` or `w.weather`, a peer's path) is grown from the host's view of `dyn.peer.<target>` and called back **through the host** |
 | `dyn.disconnect { name }` | admin | let go |
-| `dyn.peers` | viewer | each peer: kind (`ws` / `dendrite`), up, why down, interface hash, restarts, open calls, calls, calls back, remounts |
+| `dyn.peers` | viewer | each peer: kind (`ws` / `dendrite` / `in_process`, DYNAUTH-31), up, why down, interface hash, restarts, open calls, calls, calls back, remounts |
 | `dyn.names` | viewer | each peer's name — the slot's list |
 | `dyn.consent { peer, needs?, callers? }` | admin | DYNAUTH-5: the needs `peer` may call back up (`method`, or `method@scope` for only there; a subset of what it declares) and the roles whose holders may call into it; replaces what it held |
 | `dyn.jwks` | public | DYNAUTH-12: the JWK Set (Ed25519, `kid` = `key:<hex>`) a peer verifies this service's tokens with |
@@ -272,6 +272,52 @@ and it is how a service mounts another service behind key sign-in
 (`--child far=wss://…`, `dyn.connect`). A context of its own would be a
 plexus-wire spec/00 change, not made.
 
+## An in-process peer needs no key proof and no forwarded token (DYNAUTH-31)
+
+The rule beside KEEL-19's. An activation of the service's own — a bridge,
+anything that answers plexus-core's `Peer` — is held in dyn's table by the
+host, never over the wire: `DynActivation::attach(name, by, peer, replace)`
+(`dyn.peers` says `kind: in_process`, `by` who attached it) and
+`DynActivation::detach(name, &peer)` (only that very peer: one connected
+over the name since is not touched). It is called as
+`dyn.peer.<name>.<path>.<method>`, admitted by the same gate as every peer
+(`dyn.{peer}`, a literal path, or its consent's `callers`).
+
+1. **No key proof**: nothing crosses a transport, so there is no
+   connection to prove and no `_info` to ask; it is never pinned and proves
+   no key.
+2. **No forwarded token**: it is called with the caller's own context, as
+   any activation of the service is; dyn mints it nothing (no mint record,
+   no `hop.token`).
+3. **No token for another peer through it**: `dyn.exchange` finds its
+   presenter and its audience by their keys, and an in-process peer has
+   none, so it is neither — a token for another peer is never obtained by
+   presenting it, nor one addressed to it. A token bound to no key (what a
+   pipe child holds) is not exchanged (KEEL-19).
+4. **No needs**: it calls nothing back through dyn, so `dyn.consent` gives
+   it `callers` only (never a method it marks `everywhere`, KEEL-31); a
+   `needs` is refused, as for a peer that declares none.
+5. **Stopped as any peer**: `dyn.revoke` refuses its next call at once and
+   ends every call open into it with one error item saying why; it stays
+   revoked across the service's restarts (`consent.json`), attached again
+   revoked, until it is attached with `replace` — an admin's new
+   registration, as `connect … replace` is. `dyn.disconnect` lets it go and
+   ends its open calls the same way.
+
+6. **Its consent is its holder's** (D2): a consent given for an in-process
+   peer holds only while the same attacher (`by`) serves the same `binding`
+   (the attacher's word for what the peer is: plexus-bridge passes its
+   binding hash). Another holder of the name — another binding, a keyless
+   WebSocket peer or dendrite with `replace`, or the reverse — is another
+   client and starts with no consent; `detach` drops it. A keyed peer's
+   consent is its key's, as before.
+7. **`holds(name, &peer)`**: whether dyn serves that very peer as `name`
+   and keeps no revocation for it. An attacher asks before it acts for the
+   peer outside a call (plexus-bridge: a sign-in, a key checked at an API,
+   a refresh), so a revoked or replaced peer acts for no one.
+
+It is not served at the service's top level (`top_level`).
+
 ## Onward calls (DYNAUTH-6)
 
 A peer's call back is held to its needs, to consent, and to the token its
@@ -360,7 +406,10 @@ only once its role is consented, a consent beyond what is declared refused,
 a dendrite's call back refused until its need is consented; a peer proving
 its key at `_info` (plexus-core's far side over a WebSocket), refused at a
 remount under another key, and its consent dropped when connected again
-under it. The dendrite needs
+under it; DYNAUTH-31: an in-process peer called as its caller with no
+token minted (a keyed peer beside it is minted one), no exchange naming it
+audience or presented through it, consent giving it callers only, and
+revoke and disconnect ending its open calls. The dendrite needs
 `plexus-dendrite` (the sibling checkout, or `PLEXUS_DENDRITE`) and Node 22.
 
 ## Rough

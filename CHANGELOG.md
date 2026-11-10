@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.3.0] — unreleased
+
+DYNAUTH-31 (breaking only in that `PeerKind` gains a variant): **an
+in-process peer.** `DynActivation::attach(name, by, peer, replace)` holds
+any plexus-core `Peer` served in this process (plexus-bridge's bridges) in
+dyn's table as `dyn.peer.<name>` — `PeerKind::InProcess { by }`, listed by
+`dyn.peers` as `kind: in_process` — and `DynActivation::detach(name, &peer)`
+lets go of it (only that very peer). It is gated as every peer, called with
+the caller's own context, and **needs no key proof and no forwarded token**:
+dyn mints it nothing, and it is never an exchange's presenter or audience
+(both are found by key), so no token addressed to another peer is obtained
+through it — the rule written beside KEEL-19's in README "An in-process
+peer needs no key proof and no forwarded token". `dyn.revoke` refuses its
+next call and ends every call open into it with one error item saying why;
+the revocation stands when it is attached again and ends only with
+`replace`. `dyn.disconnect` ends its open calls too. `dyn.consent` gives it
+`callers` only (it declares no needs). Not served at the top level.
+`DynActivation::get` answers `Unavailable` for an in-process name (it is not
+a mount); a `--peers` entry naming one is skipped.
+
+Review 1: **a consent is its holder's, not its name's** (D2, KEEL-24
+extended). `Consent` gains `holder` — none for a keyed peer (its key
+decides, unchanged), `ws` or `dendrite` for a keyless one, and
+`in_process:<by>:<binding>` for an in-process one; `Consent::is_for` decides
+wherever a consent is applied or kept. `attach` takes `binding` (the
+attacher's word for what the peer is). Another holder of a name — another
+binding, a keyless peer of another kind, an in-process peer over a remote
+one or the reverse — starts with no consent, and `detach` drops it. A
+consent kept before 0.3.0 reads as a keyed or keyless remote peer's.
+`DynActivation::holds(name, &peer)`: whether dyn serves that very peer,
+unrevoked — what an attacher asks before acting for it outside a call.
+`PeerKind` is `#[non_exhaustive]`.
+
+**Moving from 0.2.1:**
+
+- A `match` on `PeerKind` needs a wildcard arm (`#[non_exhaustive]`);
+  `Consent` gains `holder` (a struct literal names it).
+- `dyn.{peer}` now reaches every in-process peer (every bridge) as well as
+  every remote peer and dendrite. Separating one peer's callers from
+  another's is `dyn.consent … callers`, which hands a role each of the
+  peer's flat method paths — not a path with dynamic segments (a bridge's
+  `repos.<owner>.<repo>.get`).
+- Consenting a dendrite's (or any peer's) need on an in-process peer that
+  acts on third-party accounts — a bridge — lets it act on each caller's
+  account there, with that caller's credential.
+- A keyless WebSocket peer or dendrite connected or grown over the name of
+  another kind (and a consent of a name now held by an in-process peer) no
+  longer inherits that name's consent.
+
 ## [0.2.1]
 
 On plexus-core 0.11.1.

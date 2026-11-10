@@ -18,6 +18,12 @@
 //!                                            or a role its consent names
 //! ```
 //!
+//! **In-process peers** (DYNAUTH-31, [`DynActivation::attach`]): an
+//! activation of the service's own (a bridge) held in the same table, called
+//! as `dyn.peer.<name>.…` with the caller's own context — no key proof, no
+//! token minted, never an exchange's presenter or audience — and revoked,
+//! disconnected and consented to (`callers`) as every peer is.
+//!
 //! **Registration and consent** (DYNAUTH-5, [`consent`]): a peer's key
 //! (proved at `_info`) and its declared `needs` are registered at connect
 //! and grow, the key pinned. Its needs are a request: an admin answers with
@@ -112,6 +118,8 @@
 //! ```
 
 pub mod contain;
+// DYNAUTH-31: a peer served in this process.
+mod in_process;
 // DYNAUTH-5: a peer's registration and an admin's consent.
 pub mod consent;
 // NEST-21: dyn's settings, on the service's configuration.
@@ -236,11 +244,15 @@ impl Default for DynOptions {
 /// What a peer is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PeerKind {
     /// A service on a WebSocket.
     Ws { url: String },
     /// A dendrite: `index.ts` in `dir`, its clients grown toward `via`.
     Dendrite { dir: String, via: Vec<String> },
+    /// DYNAUTH-31: an activation of this service, served in its process
+    /// ([`DynActivation::attach`]); `by` names who attached it.
+    InProcess { by: String },
 }
 
 /// One peer, as `dyn.peers` lists it.
@@ -452,6 +464,8 @@ impl plexus_client::FromClientError for DynEvent {
 struct Entry {
     kind: PeerKind,
     child: Option<RemoteChild>,
+    /// DYNAUTH-31: an in-process peer (then `child` is `None`, always).
+    local: Option<in_process::Local>,
     why: Option<String>,
     remounts: u64,
     /// NEST-16: the interface hash the peer must serve.
@@ -501,12 +515,14 @@ impl consent::ConsentSource for Inner {
             if store.revoked.contains_key(name) || !c.callers.iter().any(|r| r == role) {
                 continue;
             }
-            let Some(child) = peers.get(name).and_then(|e| e.child.as_ref()) else { continue };
-            // KEEL-19: a consent given for another key is another client's.
-            if c.key.as_deref() != child.peer_key() {
-                continue;
-            }
-            for m in consent::method_paths(child) {
+            let Some(e) = peers.get(name) else { continue };
+            // KEEL-19, DYNAUTH-31 (D2): a consent given for another key, or another holder, is another client's.
+            let paths = match (&e.child, &e.local) {
+                (Some(child), _) if c.is_for(child.peer_key(), consent::remote_holder(child).as_deref()) => consent::method_paths(child),
+                (None, Some(local)) if c.is_for(None, Some(&local.holder())) => in_process::method_paths(local),
+                _ => continue,
+            };
+            for m in paths {
                 out.push(format!("dyn.peer.{name}.{m}"));
                 if top.contains(name) {
                     out.push(format!("{name}.{m}"));
@@ -680,9 +696,9 @@ impl DynActivation {
     /// grows it again with `replace`. A token already in its hand lives out
     /// its `exp` (≤ 60 s) at a peer that verifies without asking.
     pub fn revoke_peer(&self, peer: &str, why: &str) -> Result<(), String> {
-        let child = match self.inner.peers.lock().unwrap().get(peer) {
+        let (child, local) = match self.inner.peers.lock().unwrap().get(peer) {
             None => return Err(format!("no peer `{peer}`")),
-            Some(e) => e.child.clone(),
+            Some(e) => (e.child.clone(), e.local.clone()),
         };
         {
             let mut store = self.inner.store.lock().unwrap();
@@ -693,6 +709,10 @@ impl DynActivation {
         if let Some(c) = &child {
             c.set_consent(Some(Vec::new()));
             c.revoke(why);
+        }
+        // DYNAUTH-31: every call open into an in-process peer ends.
+        if let Some(l) = &local {
+            l.stop(why);
         }
         self.moved();
         tracing::warn!(target: "plexus::audit", peer = %peer, %why, "dyn revoke");
@@ -837,17 +857,19 @@ impl DynActivation {
         let declared = Self::declared(child);
         let store = self.inner.store.lock().unwrap();
         // KEEL-19: a consent given for another key is another client's.
-        let given = store.consents.get(name).filter(|c| c.key.as_deref() == child.peer_key());
+        let given = store.consents.get(name).filter(|c| c.is_for(child.peer_key(), consent::remote_holder(child).as_deref()));
         child.set_consent(Some(consent::consented(given, declared.as_deref())));
     }
 
     /// DYNAUTH-5: a new registration of `name` under `key` — the consent
-    /// kept for another key is dropped (another client).
-    fn register(&self, name: &str, key: Option<&str>) {
+    /// kept for another key is dropped (another client). DYNAUTH-31 (D2):
+    /// and for another holder (a keyless peer of another kind, another
+    /// in-process peer).
+    fn register(&self, name: &str, key: Option<&str>, holder: Option<&str>) {
         let dropped = {
             let mut store = self.inner.store.lock().unwrap();
             match store.consents.get(name) {
-                Some(c) if c.key.as_deref() != key => store.consents.remove(name).is_some(),
+                Some(c) if !c.is_for(key, holder) => store.consents.remove(name).is_some(),
                 _ => false,
             }
         };
@@ -858,6 +880,15 @@ impl DynActivation {
             }
             self.moved();
         }
+    }
+
+    /// DYNAUTH-31 (review 2): the gate of the service `dyn` was started in,
+    /// as it stands — for an activation beside it that must ask a grant other
+    /// than its call's (plexus-bridge: whether a caller holds an operator's
+    /// grant on `*`). `None` before `start`, or on a service with no gate.
+    pub fn gate(&self) -> Option<Arc<plexus_auth_core::grants::Gate>> {
+        let service = self.inner.host.lock().unwrap().as_ref().and_then(WeakService::upgrade)?;
+        service.gate().cloned()
     }
 
     /// The gate's grants generation moves (consent changed what a role holds).
@@ -897,13 +928,23 @@ impl DynActivation {
 
     /// DYNAUTH-5: set what `peer` may do (replacing what it could).
     pub fn set_consent(&self, peer: &str, needs: Vec<String>, callers: Vec<String>) -> Result<Consent, String> {
-        let child = self.inner.peers.lock().unwrap().get(peer).map(|e| e.child.clone());
-        let child = match child {
+        let found = self.inner.peers.lock().unwrap().get(peer).map(|e| (e.child.clone(), e.local.as_ref().map(|l| l.holder())));
+        let child = match found {
             None => return Err(format!("no peer `{peer}`: connect or grow it first, so its needs are known")),
-            Some(None) => return Err(format!("`{peer}` is not mounted now: its needs are not known")),
-            Some(Some(c)) => c,
+            // DYNAUTH-31: an in-process peer declares no needs and proves no key: `callers` only.
+            Some((None, Some(holder))) => {
+                let c = Consent { needs, callers, key: None, holder: Some(holder) };
+                consent::check(peer, &c, None)?;
+                self.inner.store.lock().unwrap().consents.insert(peer.to_string(), c.clone());
+                self.save_store()?;
+                self.moved();
+                tracing::info!(target: "plexus::audit", peer = %peer, callers = ?c.callers, "dyn consent (in process)");
+                return Ok(c);
+            }
+            Some((None, None)) => return Err(format!("`{peer}` is not mounted now: its needs are not known")),
+            Some((Some(c), _)) => c,
         };
-        let c = Consent { needs, callers, key: child.peer_key().map(str::to_string) };
+        let c = Consent { needs, callers, key: child.peer_key().map(str::to_string), holder: consent::remote_holder(&child) };
         consent::check(peer, &c, Self::declared(&child).as_deref())?;
         self.inner.store.lock().unwrap().consents.insert(peer.to_string(), c.clone());
         self.save_store()?;
@@ -946,7 +987,13 @@ impl DynActivation {
         }
         if let Some(file) = &self.inner.opts.peers_file {
             for (name, kind) in read_peers_file(file)? {
-                self.inner.peers.lock().unwrap().insert(name, Entry { kind, child: None, why: Some("not connected yet".into()), remounts: 0, expecting: None, pin: None, presented: None });
+                let mut peers = self.inner.peers.lock().unwrap();
+                // DYNAUTH-31: a name an in-process peer holds is kept by it.
+                if peers.get(&name).is_some_and(|e| e.local.is_some()) {
+                    tracing::warn!(target: "plexus::dyn", peer = %name, "--peers names a peer held in process: not connected");
+                    continue;
+                }
+                peers.insert(name, Entry { kind, child: None, local: None, why: Some("not connected yet".into()), remounts: 0, expecting: None, pin: None, presented: None });
             }
             let names: Vec<String> = self.inner.peers.lock().unwrap().keys().cloned().collect();
             for name in names {
@@ -982,7 +1029,7 @@ impl DynActivation {
 
     async fn look_at(&self, name: String) {
         {
-            let child = self.inner.peers.lock().unwrap().get(&name).map(|e| e.child.clone());
+            let child = self.inner.peers.lock().unwrap().get(&name).filter(|e| e.local.is_none()).map(|e| e.child.clone());
             match child {
                 Some(Some(c)) if c.is_up() => {}
                 Some(Some(c)) => {
@@ -1080,6 +1127,7 @@ impl DynActivation {
                 // (`--via-host`), before its needs are known — and no other.
                 o.schemas = via.iter().map(|t| format!("dyn.peer.{t}")).collect();
             }
+            PeerKind::InProcess { .. } => {}
         }
         o
     }
@@ -1100,6 +1148,7 @@ impl DynActivation {
                 let argv = self.containment().wrap(Path::new(dir), &self.denied(), argv)?;
                 Ok(ChildSpec::Stdio { name: name.into(), argv })
             }
+            PeerKind::InProcess { .. } => Err(format!("`{name}` is served in this process: it is not mounted")),
         }
     }
 
@@ -1112,6 +1161,9 @@ impl DynActivation {
                 // Mounted (or remounted) meanwhile by another look or call.
                 if let Some(c) = e.child.as_ref().filter(|c| c.dead().is_none()) {
                     return Ok(c.clone());
+                }
+                if e.local.is_some() {
+                    return Err(format!("`{name}` is served in this process: it is not mounted"));
                 }
                 (e.kind.clone(), e.expecting.clone())
             }
@@ -1268,12 +1320,16 @@ impl DynActivation {
                     if let Some(refused) = refuse(&peers) {
                         return refused;
                     }
-                    peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin, presented: None });
+                    let old = peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), local: None, why: None, remounts: 0, expecting, pin, presented: None });
+                    // DYNAUTH-31: an in-process peer it replaces is stopped.
+                    if let Some(l) = old.and_then(|e| e.local) {
+                        l.stop("replaced");
+                    }
                 }
                 // DYNAUTH-5: registered — its key and needs — and held to
                 // what is consented for it; only once it holds its name, so
                 // a connect refused above dropped nobody's consent.
-                self.register(&name, child.peer_key());
+                self.register(&name, child.peer_key(), consent::remote_holder(&child).as_deref());
                 self.hold(&name, &child);
                 // DYNAUTH-7: an admin connecting or growing it again is a
                 // new registration: a revocation ends here.
@@ -1334,7 +1390,12 @@ impl DynActivation {
             (old, presented)
         };
         // DYNAUTH-5: another key is another client — its consent goes.
-        self.register(name, pinned.key.as_deref());
+        let holder = match (&pinned.key, self.inner.peers.lock().unwrap().get(name).map(|e| e.kind.clone())) {
+            (Some(_), _) => None,
+            (None, Some(PeerKind::Dendrite { .. })) => Some(consent::HOLDER_DENDRITE),
+            (None, _) => Some(consent::HOLDER_WS),
+        };
+        self.register(name, pinned.key.as_deref(), holder);
         tracing::warn!(target: "plexus::audit", peer = %name, actor = %plexus_core::plexus::config::current_actor().join(" < "), old = %old.as_ref().map(PeerIdentity::fingerprint).unwrap_or_default(), new = %pinned.fingerprint(), "dyn repin");
         let up = match self.mount(name, true).await {
             Ok(_) => true,
@@ -1355,8 +1416,13 @@ impl DynActivation {
             .unwrap()
             .iter()
             .map(|(name, e)| {
-                let st = e.child.as_ref().map(RemoteChild::stats).unwrap_or_default();
-                let up = e.child.as_ref().is_some_and(RemoteChild::is_up);
+                let mut st = e.child.as_ref().map(RemoteChild::stats).unwrap_or_default();
+                if let Some(l) = &e.local {
+                    st.open = l.open.load(std::sync::atomic::Ordering::Relaxed);
+                    st.calls = l.calls.load(std::sync::atomic::Ordering::Relaxed);
+                }
+                // DYNAUTH-31: an in-process peer is up while it is held and not revoked.
+                let up = e.child.as_ref().is_some_and(RemoteChild::is_up) || (e.local.is_some() && !revoked.contains_key(name));
                 let why = match (&e.child, up) {
                     (_, true) => None,
                     // A dead mount (a remount refused: NEST-16, DYNAUTH-8)'s last word is dyn's remount (refused, or failing).
@@ -1369,7 +1435,7 @@ impl DynActivation {
                     peer: e.kind.clone(),
                     up,
                     why,
-                    interface: e.child.as_ref().map(interface_of),
+                    interface: e.child.as_ref().map(interface_of).or_else(|| e.local.as_ref().map(|l| l.interface_hash())),
                     restarts: st.restarts,
                     open: st.open,
                     calls: st.calls,
@@ -1389,6 +1455,7 @@ impl DynActivation {
     pub async fn get(&self, name: &str) -> Result<RemoteChild, PeerError> {
         let child = match self.inner.peers.lock().unwrap().get(name) {
             None => return Err(PeerError::NotFound { name: name.into() }),
+            Some(e) if e.local.is_some() => return Err(PeerError::Unavailable { reason: format!("`{name}` is served in this process: it is not mounted") }),
             Some(e) => e.child.clone(),
         };
         match child {
@@ -1531,7 +1598,11 @@ impl DynActivation {
     pub async fn disconnect(&self, name: String) -> DynEvent {
         let gone = self.inner.peers.lock().unwrap().remove(&name);
         match gone {
-            Some(_) => {
+            Some(e) => {
+                // DYNAUTH-31: every call open into an in-process peer ends.
+                if let Some(l) = &e.local {
+                    l.stop("disconnected");
+                }
                 self.unsurface(&name);
                 DynEvent::Disconnected { name }
             }
@@ -1648,6 +1719,9 @@ impl DynActivation {
     /// A peer by name: `dyn.peer.<name>.<path>.<method>`.
     #[plexus_macros::peer(list = names)]
     async fn peer(&self, name: &str) -> Result<Box<dyn Peer>, PeerError> {
+        if let Some(local) = self.served_local(name)? {
+            return Ok(local);
+        }
         self.get(name).await.map(|c| Box::new(c) as Box<dyn Peer>)
     }
 }
