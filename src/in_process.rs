@@ -38,6 +38,10 @@ use crate::{check_name, DynActivation, DynEvent, Entry, Inner, PeerKind};
 #[derive(Clone)]
 pub(crate) struct Local {
     pub(crate) peer: Arc<dyn Peer>,
+    /// Who attached it and its word for what it serves: the holder its
+    /// consent is given for (D2).
+    by: String,
+    binding: String,
     /// `Some(why)` once it is stopped: every call open into it ends.
     stop: Arc<watch::Sender<Option<String>>>,
     pub(crate) open: Arc<AtomicUsize>,
@@ -45,8 +49,14 @@ pub(crate) struct Local {
 }
 
 impl Local {
-    fn new(peer: Arc<dyn Peer>) -> Self {
-        Self { peer, stop: Arc::new(watch::channel(None).0), open: Arc::default(), calls: Arc::default() }
+    fn new(peer: Arc<dyn Peer>, by: &str, binding: &str) -> Self {
+        Self { peer, by: by.into(), binding: binding.into(), stop: Arc::new(watch::channel(None).0), open: Arc::default(), calls: Arc::default() }
+    }
+
+    /// DYNAUTH-31 (D2): the holder a consent for it is given for,
+    /// `in_process:<by>:<binding>`.
+    pub(crate) fn holder(&self) -> String {
+        format!("in_process:{}:{}", self.by, self.binding)
     }
 
     /// End every call open into it, saying `why`.
@@ -168,15 +178,22 @@ impl DynActivation {
     /// stands: a peer attached again at the service's start stays revoked.
     /// Not served at the service's top level ([`DynOptions::top_level`]).
     ///
+    /// `binding` is the attacher's word for what the peer is (a bridge's
+    /// binding hash: where it sends its callers' credentials, what it
+    /// calls): a consent given for `name` holds only while `by` and
+    /// `binding` are the same (DYNAUTH-31, D2) — any other holder of the
+    /// name, in process or not, is another client and starts with none.
+    ///
     /// [`DynOptions::top_level`]: crate::DynOptions::top_level
-    pub fn attach(&self, name: &str, by: &str, peer: Arc<dyn Peer>, replace: bool) -> DynEvent {
+    pub fn attach(&self, name: &str, by: &str, binding: &str, peer: Arc<dyn Peer>, replace: bool) -> DynEvent {
         if let Some(message) = &self.inner.refused {
             return DynEvent::Error { message: message.clone() };
         }
         if let Err(message) = check_name(name) {
             return DynEvent::Error { message };
         }
-        let local = Local::new(peer);
+        let local = Local::new(peer, by, binding);
+        let holder = local.holder();
         let interface = local.peer.interface();
         let methods = interface.schema().methods.iter().map(|m| m.name.clone()).collect();
         let old = {
@@ -193,8 +210,8 @@ impl DynActivation {
         }
         // A mount it replaces may have been served at the top level; this is not.
         self.unsurface(name);
-        // DYNAUTH-5: it proves no key — a consent kept for a keyed peer of this name is another client's.
-        self.register(name, None);
+        // DYNAUTH-5, D2: it proves no key — a consent kept for any other holder of this name is another client's.
+        self.register(name, None, Some(&holder));
         if replace && self.inner.store.lock().unwrap().revoked.remove(name).is_some() {
             if let Err(why) = self.save_store() {
                 tracing::error!(target: "plexus::dyn", "{why}");
@@ -220,8 +237,30 @@ impl DynActivation {
         if let Some(l) = &e.local {
             l.stop("disconnected");
         }
+        // D2: let go by its attacher, its consent goes with it.
+        if self.inner.store.lock().unwrap().consents.remove(name).is_some() {
+            if let Err(why) = self.save_store() {
+                tracing::error!(target: "plexus::dyn", "{why}");
+            }
+        }
         self.moved();
         true
+    }
+
+    /// DYNAUTH-31 (D1): whether `peer` is what dyn serves as `name` now and
+    /// may be used — held there (not disconnected, not replaced by another
+    /// peer) and not revoked. `Err` says why not. An attacher asks before it
+    /// acts for the peer outside a call (a sign-in, a key checked, a refresh).
+    pub fn holds(&self, name: &str, peer: &Arc<dyn Peer>) -> Result<(), String> {
+        match self.inner.peers.lock().unwrap().get(name) {
+            None => return Err(format!("dyn serves no peer `{name}` (disconnected)")),
+            Some(e) if !e.local.as_ref().is_some_and(|l| l.is(peer)) => return Err(format!("dyn serves another peer as `{name}`")),
+            Some(_) => {}
+        }
+        match self.inner.store.lock().unwrap().revoked.get(name) {
+            Some(why) => Err(format!("`{name}` is revoked in dyn ({why})")),
+            None => Ok(()),
+        }
     }
 
     /// The in-process peer `name`, as the slot serves it: `Ok(None)` when

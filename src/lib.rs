@@ -244,6 +244,7 @@ impl Default for DynOptions {
 /// What a peer is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PeerKind {
     /// A service on a WebSocket.
     Ws { url: String },
@@ -515,11 +516,10 @@ impl consent::ConsentSource for Inner {
                 continue;
             }
             let Some(e) = peers.get(name) else { continue };
+            // KEEL-19, DYNAUTH-31 (D2): a consent given for another key, or another holder, is another client's.
             let paths = match (&e.child, &e.local) {
-                // KEEL-19: a consent given for another key is another client's.
-                (Some(child), _) if c.key.as_deref() == child.peer_key() => consent::method_paths(child),
-                // DYNAUTH-31: an in-process peer proves no key.
-                (None, Some(local)) if c.key.is_none() => in_process::method_paths(local),
+                (Some(child), _) if c.is_for(child.peer_key(), consent::remote_holder(child).as_deref()) => consent::method_paths(child),
+                (None, Some(local)) if c.is_for(None, Some(&local.holder())) => in_process::method_paths(local),
                 _ => continue,
             };
             for m in paths {
@@ -857,17 +857,19 @@ impl DynActivation {
         let declared = Self::declared(child);
         let store = self.inner.store.lock().unwrap();
         // KEEL-19: a consent given for another key is another client's.
-        let given = store.consents.get(name).filter(|c| c.key.as_deref() == child.peer_key());
+        let given = store.consents.get(name).filter(|c| c.is_for(child.peer_key(), consent::remote_holder(child).as_deref()));
         child.set_consent(Some(consent::consented(given, declared.as_deref())));
     }
 
     /// DYNAUTH-5: a new registration of `name` under `key` — the consent
-    /// kept for another key is dropped (another client).
-    fn register(&self, name: &str, key: Option<&str>) {
+    /// kept for another key is dropped (another client). DYNAUTH-31 (D2):
+    /// and for another holder (a keyless peer of another kind, another
+    /// in-process peer).
+    fn register(&self, name: &str, key: Option<&str>, holder: Option<&str>) {
         let dropped = {
             let mut store = self.inner.store.lock().unwrap();
             match store.consents.get(name) {
-                Some(c) if c.key.as_deref() != key => store.consents.remove(name).is_some(),
+                Some(c) if !c.is_for(key, holder) => store.consents.remove(name).is_some(),
                 _ => false,
             }
         };
@@ -917,12 +919,12 @@ impl DynActivation {
 
     /// DYNAUTH-5: set what `peer` may do (replacing what it could).
     pub fn set_consent(&self, peer: &str, needs: Vec<String>, callers: Vec<String>) -> Result<Consent, String> {
-        let found = self.inner.peers.lock().unwrap().get(peer).map(|e| (e.child.clone(), e.local.is_some()));
+        let found = self.inner.peers.lock().unwrap().get(peer).map(|e| (e.child.clone(), e.local.as_ref().map(|l| l.holder())));
         let child = match found {
             None => return Err(format!("no peer `{peer}`: connect or grow it first, so its needs are known")),
             // DYNAUTH-31: an in-process peer declares no needs and proves no key: `callers` only.
-            Some((None, true)) => {
-                let c = Consent { needs, callers, key: None };
+            Some((None, Some(holder))) => {
+                let c = Consent { needs, callers, key: None, holder: Some(holder) };
                 consent::check(peer, &c, None)?;
                 self.inner.store.lock().unwrap().consents.insert(peer.to_string(), c.clone());
                 self.save_store()?;
@@ -930,10 +932,10 @@ impl DynActivation {
                 tracing::info!(target: "plexus::audit", peer = %peer, callers = ?c.callers, "dyn consent (in process)");
                 return Ok(c);
             }
-            Some((None, false)) => return Err(format!("`{peer}` is not mounted now: its needs are not known")),
+            Some((None, None)) => return Err(format!("`{peer}` is not mounted now: its needs are not known")),
             Some((Some(c), _)) => c,
         };
-        let c = Consent { needs, callers, key: child.peer_key().map(str::to_string) };
+        let c = Consent { needs, callers, key: child.peer_key().map(str::to_string), holder: consent::remote_holder(&child) };
         consent::check(peer, &c, Self::declared(&child).as_deref())?;
         self.inner.store.lock().unwrap().consents.insert(peer.to_string(), c.clone());
         self.save_store()?;
@@ -1318,7 +1320,7 @@ impl DynActivation {
                 // DYNAUTH-5: registered — its key and needs — and held to
                 // what is consented for it; only once it holds its name, so
                 // a connect refused above dropped nobody's consent.
-                self.register(&name, child.peer_key());
+                self.register(&name, child.peer_key(), consent::remote_holder(&child).as_deref());
                 self.hold(&name, &child);
                 // DYNAUTH-7: an admin connecting or growing it again is a
                 // new registration: a revocation ends here.
@@ -1379,7 +1381,12 @@ impl DynActivation {
             (old, presented)
         };
         // DYNAUTH-5: another key is another client — its consent goes.
-        self.register(name, pinned.key.as_deref());
+        let holder = match (&pinned.key, self.inner.peers.lock().unwrap().get(name).map(|e| e.kind.clone())) {
+            (Some(_), _) => None,
+            (None, Some(PeerKind::Dendrite { .. })) => Some(consent::HOLDER_DENDRITE),
+            (None, _) => Some(consent::HOLDER_WS),
+        };
+        self.register(name, pinned.key.as_deref(), holder);
         tracing::warn!(target: "plexus::audit", peer = %name, actor = %plexus_core::plexus::config::current_actor().join(" < "), old = %old.as_ref().map(PeerIdentity::fingerprint).unwrap_or_default(), new = %pinned.fingerprint(), "dyn repin");
         let up = match self.mount(name, true).await {
             Ok(_) => true,

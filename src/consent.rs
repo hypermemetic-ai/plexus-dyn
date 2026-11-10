@@ -50,6 +50,47 @@ pub struct Consent {
     /// none (a dendrite on its pipe).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// DYNAUTH-31 (D2): for a peer that proved no key, the holder it was
+    /// given for — `ws` or `dendrite` (by kind), or `in_process:<by>:<binding>`
+    /// (the attacher's word for what it serves). `None` for a keyed peer (its
+    /// key decides), and in a consent kept before 0.3.0 (read as a keyless
+    /// WebSocket peer's or dendrite's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
+}
+
+impl Consent {
+    /// DYNAUTH-31 (D2): whether this consent was given to the peer that
+    /// holds its name now — the same key, and for a keyless one the same
+    /// holder. A new holder of the name is another client: no consent.
+    pub fn is_for(&self, key: Option<&str>, holder: Option<&str>) -> bool {
+        if self.key.as_deref() != key {
+            return false;
+        }
+        match (&self.holder, holder) {
+            (Some(a), b) => Some(a.as_str()) == b,
+            // Kept before 0.3.0: a keyed peer's, or a keyless remote one's.
+            (None, b) => b.is_none() || matches!(b, Some(HOLDER_WS | HOLDER_DENDRITE)),
+        }
+    }
+}
+
+/// DYNAUTH-31 (D2): the holder of a keyless WebSocket peer's consent.
+pub const HOLDER_WS: &str = "ws";
+/// DYNAUTH-31 (D2): the holder of a dendrite's consent (on its pipe, no key).
+pub const HOLDER_DENDRITE: &str = "dendrite";
+
+/// DYNAUTH-31 (D2): the holder of a mounted peer's consent — none when it
+/// proved a key (the key decides, as before), else its kind.
+pub(crate) fn remote_holder(child: &RemoteChild) -> Option<String> {
+    if child.peer_key().is_some() {
+        return None;
+    }
+    Some(match child.spec() {
+        plexus_core::plexus::ChildSpec::Ws { .. } => HOLDER_WS,
+        plexus_core::plexus::ChildSpec::Stdio { .. } => HOLDER_DENDRITE,
+    }
+    .to_string())
 }
 
 /// One peer's registration and consent, as `dyn.consents` lists it.
@@ -214,7 +255,7 @@ mod tests {
     #[test]
     fn a_consent_is_within_what_is_declared() {
         let declared = vec!["shop.items".to_string(), "dyn.peer.w.weather.forecast".to_string()];
-        let ok = Consent { needs: vec!["shop.items@MENGER".into()], callers: vec!["viewer".into()], key: None };
+        let ok = Consent { needs: vec!["shop.items@MENGER".into()], callers: vec!["viewer".into()], key: None, holder: None };
         assert!(check("p", &ok, Some(&declared)).is_ok());
         let wider = Consent { needs: vec!["dyn.grow".into()], ..Consent::default() };
         assert!(check("p", &wider, Some(&declared)).unwrap_err().contains("dyn.grow"));
@@ -234,7 +275,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("consent.json");
         let mut s = Store::default();
-        s.consents.insert("w".into(), Consent { needs: vec!["a.b".into()], callers: vec![], key: Some("key:00".into()) });
+        s.consents.insert("w".into(), Consent { needs: vec!["a.b".into()], callers: vec![], key: Some("key:00".into()), holder: None });
         s.save(&path).unwrap();
         assert_eq!(Store::load(&path).unwrap().consents, s.consents);
         #[cfg(unix)]
