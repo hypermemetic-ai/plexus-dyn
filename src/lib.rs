@@ -198,6 +198,16 @@ pub struct DynOptions {
     /// NEST-25: an offer waits this long for an operator, then is refused
     /// `pending_expired` (10 minutes).
     pub dial_in_pending_age: Duration,
+    /// NEST-25 (review M1): offers from one address (an IPv4 address, or an
+    /// IPv6 /64) a minute that may wait pending (10); past it, `rate_limited`.
+    pub dial_in_offers_per_minute_per_address: usize,
+    /// NEST-25 (review M1, L4): offers by one key a minute that may wait
+    /// pending (3) — each a fresh pairing code; past it, `rate_limited`.
+    pub dial_in_offers_per_minute_per_key: usize,
+    /// For tests: called once a dial-in offer's schema is vetted, before it
+    /// is put in the table (review L1's race, made to happen).
+    #[doc(hidden)]
+    pub dial_in_vetted: Option<VettedHook>,
     /// NEST-21: the configuration `dyn` reads its settings from
     /// (`transport.insecure_ws`, `transport.tls_roots`, `child.*`,
     /// `dyn.*`). `None`: the service's own ([`DynamicHub::config`]), taken
@@ -207,6 +217,17 @@ pub struct DynOptions {
     /// are its flag layer: what the host was started with, which a runtime
     /// set goes over and a reset comes back to.
     pub config: Option<Config>,
+}
+
+/// For tests: [`DynOptions::dial_in_vetted`].
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct VettedHook(pub Arc<dyn Fn(&str) + Send + Sync>);
+
+impl std::fmt::Debug for VettedHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VettedHook(..)")
+    }
 }
 
 /// DYNAUTH-7: an audit sink for [`DynOptions::audit`].
@@ -259,6 +280,9 @@ impl Default for DynOptions {
             dial_in_pending_max: 16,
             dial_in_pending_per_address: 4,
             dial_in_pending_age: Duration::from_secs(600),
+            dial_in_offers_per_minute_per_address: 10,
+            dial_in_offers_per_minute_per_key: 3,
+            dial_in_vetted: None,
         }
     }
 }
@@ -545,6 +569,8 @@ struct Inner {
     pending: Mutex<dial_in::PendingTable>,
     /// NEST-25: the dial-in door, once opened.
     door: Mutex<Option<DialIn>>,
+    /// NEST-25 (review M1): offers gone pending in the last minute.
+    offer_rates: Mutex<dial_in::OfferRates>,
 }
 
 impl consent::ConsentSource for Inner {
@@ -641,6 +667,7 @@ impl DynActivation {
                 config: Mutex::new(config.clone()),
                 pending: Mutex::default(),
                 door: Mutex::default(),
+                offer_rates: Mutex::default(),
             }),
         };
         let this = if load { this.loaded() } else { this };

@@ -65,6 +65,21 @@ impl Restock {
             }
         }
     }
+    /// Reaches past its needs, by hand, on the raw connection back.
+    #[plexus_macros::method]
+    pub async fn sneak(&self) -> Value {
+        use plexus_client::{MethodRef, StreamItem, Transport};
+        let t = match plexus_core::plexus::remote_child::host() {
+            Ok(t) => t,
+            Err(e) => return json!({ "no_host": e.to_string() }),
+        };
+        let items: Vec<_> = t.call(MethodRef::new("dyn", "rotate_key"), json!({})).collect().await;
+        match items.into_iter().next() {
+            Some(Ok(StreamItem::Data { content, .. })) => json!({ "reached": content }),
+            Some(Ok(StreamItem::Error { message, .. })) => json!({ "refused": message }),
+            other => json!({ "refused": format!("{other:?}") }),
+        }
+    }
     /// The parent's items, called back through the host.
     #[plexus_macros::method]
     pub async fn low(&self, parent: Parent<shop::ShopClient>) -> Value {
@@ -455,47 +470,155 @@ async fn a_refused_key_stays_refused() {
     assert!(listed(&host).is_empty());
 }
 
-/// Two offers wait; a third is refused `pending_full` — by the cap in all
-/// (`max`), or the cap from one address (`per_address`).
-async fn capped(seed: u8, max: usize, per_address: usize) {
-    let dir = tempfile::tempdir().unwrap();
+/// Review M1: offers are held to a rate per address and per key, an
+/// address past its share displaces its own oldest, and a full list makes
+/// room from its busiest address — so a few addresses cannot hold first
+/// contact shut.
+fn limits(o: &mut DynOptions) {
+    o.dial_in_pending_max = 3;
+    o.dial_in_pending_per_address = 2;
+    o.dial_in_pending_age = Duration::from_secs(30);
+    o.dial_in_offers_per_minute_per_address = 100;
+    o.dial_in_offers_per_minute_per_key = 100;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_address_past_its_share_displaces_its_own_oldest_offer() {
+    let host = host_with(limits).await;
+    let mut a = offer_from(&host, 41, "a", "127.0.0.2").await;
+    assert_eq!(answered_within(&mut a, 300).await, None, "a waits");
+    let mut b = offer_from(&host, 42, "b", "127.0.0.2").await;
+    assert_eq!(answered_within(&mut b, 300).await, None, "b waits");
+    let mut c = offer_from(&host, 43, "c", "127.0.0.2").await;
+    assert_eq!(answered_within(&mut c, 300).await, None, "c waits too: its address's share is taken from its own oldest");
+    assert_eq!(kind_of(&answered_within(&mut a, 2000).await).as_deref(), Some("superseded"));
+    assert_eq!(pending_names(&host), ["b", "c"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_list_makes_room_from_its_busiest_address() {
+    let host = host_with(limits).await;
+    let mut a = offer_from(&host, 51, "a", "127.0.0.2").await;
+    assert_eq!(answered_within(&mut a, 300).await, None);
+    let mut b = offer_from(&host, 52, "b", "127.0.0.2").await;
+    assert_eq!(answered_within(&mut b, 300).await, None);
+    let mut c = offer_from(&host, 53, "c", "127.0.0.3").await;
+    assert_eq!(answered_within(&mut c, 300).await, None);
+    // Full (3). A newcomer from a fourth address is not shut out: the busiest address gives its oldest.
+    let mut d = offer_from(&host, 54, "d", "127.0.0.4").await;
+    assert_eq!(answered_within(&mut d, 300).await, None, "the newcomer waits");
+    assert_eq!(kind_of(&answered_within(&mut a, 2000).await).as_deref(), Some("superseded"));
+    assert_eq!(pending_names(&host), ["b", "c", "d"]);
+    // Spread evenly, one an address: a fifth address is refused, nobody's is taken.
+    let mut e = offer_from(&host, 55, "e", "127.0.0.5").await;
+    let mut f = offer_from(&host, 56, "f", "127.0.0.6").await;
+    let (e, f) = (answered_within(&mut e, 2000).await, answered_within(&mut f, 300).await);
+    assert!(kind_of(&e).as_deref() == Some("pending_full") || kind_of(&f).as_deref() == Some("pending_full"), "{e:?} {f:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offers_from_one_address_are_rate_limited() {
     let host = host_with(|o| {
-        o.dial_in_pending_max = max;
-        o.dial_in_pending_per_address = per_address;
-        o.dial_in_pending_age = Duration::from_millis(1500);
+        limits(o);
+        o.dial_in_pending_per_address = 10;
+        o.dial_in_pending_max = 10;
+        o.dial_in_offers_per_minute_per_address = 3;
     })
     .await;
-    let (k1, _) = key(dir.path(), "n1", seed);
-    let (k2, _) = key(dir.path(), "n2", seed + 1);
-    let (k3, _) = key(dir.path(), "n3", seed + 2);
-    let n1 = node(&host, "n1", &k1);
-    until("n1 pending", || n1.pending().is_some()).await;
-    // One per key: the same key again supersedes the first.
-    let n1b = node(&host, "n1", &k1);
-    let superseded = n1.mounted(Duration::from_secs(5)).await.unwrap_err();
-    assert!(superseded.contains("superseded"), "{superseded}");
-    until("n1b pending", || n1b.pending().is_some()).await;
-    let n2 = node(&host, "n2", &k2);
-    until("n2 pending", || n2.pending().is_some()).await;
-    let n3 = node(&host, "n3", &k3);
-    let full = n3.mounted(Duration::from_secs(5)).await.unwrap_err();
-    assert!(full.contains("pending_full"), "max {max}, per address {per_address}: {full}");
-    assert_eq!(host.dyn_.pending_list().len(), 2);
-    // And each waits its age, no longer.
-    let expired = n2.mounted(Duration::from_secs(5)).await.unwrap_err();
-    assert!(expired.contains("pending_expired"), "{expired}");
+    let mut socks = Vec::new();
+    for (i, seed) in [61u8, 62, 63].into_iter().enumerate() {
+        let mut ws = offer_from(&host, seed, &format!("n{i}"), "127.0.0.7").await;
+        assert_eq!(answered_within(&mut ws, 300).await, None);
+        socks.push(ws);
+    }
+    let mut fourth = offer_from(&host, 64, "n3", "127.0.0.7").await;
+    assert_eq!(kind_of(&answered_within(&mut fourth, 2000).await).as_deref(), Some("rate_limited"));
+    // Another address is not held to this one's rate.
+    let mut other = offer_from(&host, 65, "n4", "127.0.0.8").await;
+    assert_eq!(answered_within(&mut other, 300).await, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_offers_by_one_key_are_rate_limited() {
+    let host = host_with(|o| {
+        limits(o);
+        o.dial_in_offers_per_minute_per_key = 2;
+    })
+    .await;
+    // Each re-offer is a fresh code: the rate bounds how many codes one key may try.
+    let mut first = offer_from(&host, 71, "k", "127.0.0.9").await;
+    assert_eq!(answered_within(&mut first, 300).await, None);
+    let mut second = offer_from(&host, 71, "k", "127.0.0.10").await;
+    assert_eq!(answered_within(&mut second, 300).await, None);
+    assert_eq!(kind_of(&answered_within(&mut first, 2000).await).as_deref(), Some("superseded"), "one pending a key");
+    let mut third = offer_from(&host, 71, "k", "127.0.0.11").await;
+    assert_eq!(kind_of(&answered_within(&mut third, 2000).await).as_deref(), Some("rate_limited"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_offer_waits_its_age_no_longer() {
+    let host = host_with(|o| {
+        limits(o);
+        o.dial_in_pending_age = Duration::from_millis(800);
+    })
+    .await;
+    let mut a = offer_from(&host, 81, "a", "127.0.0.12").await;
+    assert_eq!(kind_of(&answered_within(&mut a, 3000).await).as_deref(), Some("pending_expired"));
     until("none pending", || host.dyn_.pending_list().is_empty()).await;
     assert!(listed(&host).is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pending_is_capped_in_all_per_key_and_in_age() {
-    capped(11, 2, 100).await;
-}
+// ------------------------------------------------------------------ review M2, L1
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn pending_is_capped_per_address() {
-    capped(31, 100, 2).await;
+async fn admit_by_key_is_refused_while_an_offer_with_a_code_waits() {
+    let host = host().await;
+    let me = plexus_core::plexus::peer_token::PeerKey::from_seed([91; 32]).kid().to_string();
+    let mut ws = offer_from(&host, 91, "shop", "127.0.0.13").await;
+    assert_eq!(answered_within(&mut ws, 300).await, None);
+    let code = host.dyn_.pending_list()[0].code.clone().unwrap();
+    // By name and key: refused — the code is how this offer is admitted.
+    for args in [json!({ "name": "shop", "key": me }), json!({ "name": "other", "key": me }), json!({ "name": "shop", "key": "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" })] {
+        let said = admit(&host, args.clone()).await;
+        assert_eq!(said[0]["type"], "error", "{args}: {said:?}");
+        assert!(said[0]["message"].as_str().unwrap().contains("--code"), "{said:?}");
+    }
+    assert_eq!(pending_names(&host), ["shop"], "still waiting");
+    // By its code: admitted.
+    let said = admit(&host, json!({ "code": code })).await;
+    assert_eq!(said[0]["type"], "admitted", "{said:?}");
+}
+
+/// Review L1: an operator refusing a key while its node is between the
+/// check of its schema and its place in the table — the mount is refused,
+/// and nothing is left in dyn's table or in the dial-in table under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refuse_racing_a_mount_leaves_nothing_mounted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (k, alice) = key(dir.path(), "alice", 92);
+    let (at_vet, vetted) = std::sync::mpsc::channel::<()>();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let wait = Arc::new(Mutex::new(wait));
+    let host = host_with(move |o| {
+        o.dial_in_vetted = Some(plexus_dyn::VettedHook(Arc::new(move |_name: &str| {
+            let _ = at_vet.send(());
+            let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(10));
+        })));
+    })
+    .await;
+    admit(&host, json!({ "name": "alice", "key": alice })).await;
+    let a = node(&host, "alice", &k);
+    tokio::task::spawn_blocking(move || vetted.recv_timeout(Duration::from_secs(10)).expect("the mount reached its vet")).await.unwrap();
+    // Between vet and the table: the operator refuses the key.
+    let said = call(&host, ADMIN, "dyn.refuse", json!({ "key": alice })).await.unwrap();
+    assert_eq!(said[0]["type"], "key_refused", "{said:?}");
+    go.send(()).unwrap();
+    let refused = a.mounted(Duration::from_secs(10)).await;
+    assert!(refused.is_err(), "mounted past a refusal: {refused:?}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(listed(&host).is_empty(), "{:?}", listed(&host));
+    assert!(host.door.names().is_empty(), "left in the dial-in table: {:?}", host.door.names());
+    assert!(call(&host, ADMIN, "dyn.peer.alice.hello", json!({ "name": "x" })).await.is_err());
 }
 
 // ------------------------------------------------------------------ row 3
@@ -519,6 +642,75 @@ async fn a_graft_calls_back_as_its_caller_within_its_consent() {
     assert_eq!(got[0]["low"]["caller"], ADMIN, "{got:?}");
 }
 
+/// The same graft served as a dialed WebSocket peer (`dyn.connect`), on a
+/// connection proven at its upgrade, trusting dyn's dial key.
+async fn dialed_restock(host: &Host) -> u16 {
+    let port = port();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    let upgrade = Arc::new(plexus_core::plexus::remote_child::KeyedUpgrade::new([format!("ws://127.0.0.1:{port}")]));
+    let trusted = vec![host.dyn_.dial_principal().unwrap()];
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else { break };
+            let (upgrade, trusted) = (Arc::clone(&upgrade), trusted.clone());
+            tokio::spawn(async move {
+                let _ = plexus_core::plexus::remote_child::serve_child_ws(Restock, tcp, &upgrade, trusted, None, None).await;
+            });
+        }
+    });
+    port
+}
+
+/// What `path`'s `low` and `sneak` give each caller: the rules of a peer's
+/// calls back, as a table to compare.
+async fn calls_back(host: &Host, path: &str) -> Vec<(String, bool)> {
+    let capped = AuthContext::for_principal(&ADMIN.parse().unwrap(), "s1", vec![], json!({ plexus_auth_core::grants::CEILING_KEY: ["viewer@*"] }));
+    let mut out = Vec::new();
+    for (label, ctx, method) in [
+        ("admin sneak", who(ADMIN), "sneak"),
+        ("viewer low", who(VIEWER), "low"),
+        ("admin ceilinged to viewer low", capped, "low"),
+        ("admin low", who(ADMIN), "low"),
+    ] {
+        let reached = match host.service.route(&format!("{path}.{method}"), json!({}), Some(&ctx)).await {
+            Err(_) => false,
+            Ok(s) => {
+                let items: Vec<PlexusStreamItem> = s.collect().await;
+                let said = format!("{items:?}");
+                said.contains("flour") || said.contains("reached")
+            }
+        };
+        out.push((label.to_string(), reached));
+    }
+    out
+}
+
+/// KEEL-19's rules for a peer's calls back hold for a dial-in peer as for a
+/// dialed one: never past its needs, even under an admin's call; each as the
+/// caller of the call it serves, within that caller's reach and ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_in_peers_calls_back_keep_the_rules_of_a_dialed_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (k, alice) = key(dir.path(), "alice", 16);
+    let host = host().await;
+    admit(&host, json!({ "name": "alice", "key": alice })).await;
+    let a = node(&host, "alice", &k);
+    a.mounted(Duration::from_secs(10)).await.unwrap();
+    let port = dialed_restock(&host).await;
+    let got = call(&host, ADMIN, "dyn.connect", json!({ "name": "far", "url": format!("ws://127.0.0.1:{port}") })).await.unwrap();
+    assert_eq!(got[0]["type"], "connected", "{got:?}");
+    for peer in ["alice", "far"] {
+        call(&host, ADMIN, "dyn.consent", json!({ "peer": peer, "needs": ["shop.items"], "callers": ["viewer"] })).await.unwrap();
+    }
+    let dialed = calls_back(&host, "dyn.peer.far").await;
+    let dialed_in = calls_back(&host, "dyn.peer.alice").await;
+    assert_eq!(dialed_in, dialed, "a dial-in peer's calls back are held as a dialed peer's");
+    // And the rules themselves: past its needs never; a viewer's call back is the viewer's.
+    assert_eq!(dialed_in[0], ("admin sneak".to_string(), false));
+    assert_eq!(dialed_in[1], ("viewer low".to_string(), false));
+    assert_eq!(dialed_in[3], ("admin low".to_string(), true));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_graft_whose_needs_this_service_does_not_serve_is_refused_at_its_mount() {
     let dir = tempfile::tempdir().unwrap();
@@ -536,8 +728,16 @@ async fn a_graft_whose_needs_this_service_does_not_serve_is_refused_at_its_mount
 
 // ------------------------------------------------------------------ rows 2, 6: a socket by hand
 
-/// A raw socket signed in as `seed`'s key (or anonymous), and its frames.
-async fn raw(host: &Host, seed: Option<u8>) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+/// A socket by hand.
+type Ws = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+/// A raw socket signed in as `seed`'s key (or anonymous), from 127.0.0.1.
+async fn raw(host: &Host, seed: Option<u8>) -> Ws {
+    raw_from(host, seed, "127.0.0.1").await
+}
+
+/// A raw socket signed in as `seed`'s key (or anonymous), from the loopback address `src`.
+async fn raw_from(host: &Host, seed: Option<u8>, src: &str) -> Ws {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = host.url.as_str().into_client_request().unwrap();
     if let Some(seed) = seed {
@@ -545,15 +745,19 @@ async fn raw(host: &Host, seed: Option<u8>) -> tokio_tungstenite::WebSocketStrea
         let bearer = plexus_core::plexus::remote_child::dial_proof(&k, &host.url);
         req.headers_mut().insert("authorization", format!("Bearer {bearer}").parse().unwrap());
     }
-    tokio_tungstenite::connect_async(req).await.unwrap().0
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind(format!("{src}:0").parse().unwrap()).unwrap();
+    let port: u16 = host.url.trim_start_matches("ws://127.0.0.1:").trim_end_matches("/ws").parse().unwrap();
+    let tcp = sock.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+    tokio_tungstenite::client_async(req, tcp).await.unwrap().0
 }
 
-async fn send(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, v: Value) {
+async fn send(ws: &mut Ws, v: Value) {
     ws.send(Message::text(v.to_string())).await.unwrap();
 }
 
 /// The next frame whose `id` is `id`, within `secs`.
-async fn answer_to(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, id: &str, secs: u64) -> Value {
+async fn answer_to(ws: &mut Ws, id: &str, secs: u64) -> Value {
     tokio::time::timeout(Duration::from_secs(secs), async {
         loop {
             let Some(Ok(Message::Text(t))) = ws.next().await else { panic!("the socket ended") };
@@ -568,7 +772,7 @@ async fn answer_to(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite
 }
 
 /// The host's nonce, from `_info {nonce, commit}`.
-async fn info(ws: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, node_nonce: &str) -> String {
+async fn info(ws: &mut Ws, node_nonce: &str) -> String {
     send(ws, json!({ "jsonrpc": "2.0", "id": "i", "method": "_info", "params": { "nonce": "n", "commit": plexus_core::plexus::remote_child::pairing::commitment(node_nonce) } })).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -616,18 +820,51 @@ async fn an_anonymous_socket_or_an_unproven_key_mounts_nothing_and_learns_nothin
 }
 
 /// A node that signs its offer properly and then never answers.
-async fn silent(host: &Host, seed: u8, name: &str) -> (tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, Value) {
+async fn silent(host: &Host, seed: u8, name: &str) -> (Ws, Value) {
+    let ws = offer_from(host, seed, name, "127.0.0.1").await;
+    let me = plexus_core::plexus::peer_token::PeerKey::from_seed([seed; 32]).kid().to_string();
+    (ws, json!(me))
+}
+
+/// A properly signed offer of `name` by `seed`'s key from `src`, sent; the
+/// node answers nothing more.
+async fn offer_from(host: &Host, seed: u8, name: &str, src: &str) -> Ws {
+    use base64::Engine;
     use ed25519_dalek::Signer;
     let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
     let me = plexus_core::plexus::peer_token::PeerKey::from_seed([seed; 32]).kid().to_string();
-    let mut ws = raw(host, Some(seed)).await;
+    let mut ws = raw_from(host, Some(seed), src).await;
     let host_nonce = info(&mut ws, "nn").await;
     let input = plexus_core::plexus::remote_child::possession_input(host.door.host_key(), &me, "nn", &host_nonce, "host", name);
-    use base64::Engine;
     let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.sign(input.as_bytes()).to_bytes());
     send(&mut ws, json!({ "jsonrpc": "2.0", "id": "o", "method": "host.offer", "params": { "namespace": name, "mount": name, "pairing_nonce": "nn", "possession": sig } })).await;
-    let me = json!(me);
-    (ws, me)
+    ws
+}
+
+/// Whether the offer on `ws` is answered within `ms`: `Some(answer)`, or
+/// `None` (still waiting, pending).
+async fn answered_within(ws: &mut Ws, ms: u64) -> Option<Value> {
+    tokio::time::timeout(Duration::from_millis(ms), async {
+        loop {
+            let Some(Ok(Message::Text(t))) = ws.next().await else { return json!({ "closed": true }) };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v.get("method").is_none() && v["id"] == json!("o") {
+                return v;
+            }
+        }
+    })
+    .await
+    .ok()
+}
+
+fn kind_of(answer: &Option<Value>) -> Option<String> {
+    answer.as_ref().and_then(|a| a.pointer("/error/data/error_kind")).and_then(Value::as_str).map(str::to_string)
+}
+
+fn pending_names(host: &Host) -> Vec<String> {
+    let mut n: Vec<String> = host.dyn_.pending_list().into_iter().map(|p| p.name).collect();
+    n.sort();
+    n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

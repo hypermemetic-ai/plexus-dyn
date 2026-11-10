@@ -58,15 +58,34 @@ pub struct PendingInfo {
 pub(crate) struct Pending {
     pub(crate) info: PendingInfo,
     socket: u64,
+    /// The address it is counted under ([`address_group`]).
+    group: String,
     release: oneshot::Sender<Result<(), OfferRefused>>,
 }
+
+/// Review M1: the offers that went pending in the last minute, by address
+/// group (`a:<group>`) and by key (`k:<key>`).
+pub(crate) type OfferRates = std::collections::HashMap<String, std::collections::VecDeque<std::time::Instant>>;
 
 /// The pending offers, by socket.
 pub(crate) type PendingTable = BTreeMap<u64, Pending>;
 
-/// The address part of `ip:port` (the port is the socket's, not the machine's).
-fn address_of(from: &str) -> String {
-    from.parse::<std::net::SocketAddr>().map(|a| a.ip().to_string()).unwrap_or_else(|_| from.to_string())
+/// The address an offer is counted under: an IPv4 address, or the /64 of an
+/// IPv6 one (one site's), without the port (the socket's, not the
+/// machine's). Behind a reverse proxy every offer is the proxy's.
+pub(crate) fn address_group(from: Option<&str>) -> String {
+    let Some(from) = from else { return "unknown".into() };
+    match from.parse::<std::net::SocketAddr>().map(|a| a.ip()) {
+        Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        Err(_) => from.to_string(),
+    }
 }
 
 pub(crate) fn now() -> u64 {
@@ -88,6 +107,12 @@ impl std::fmt::Debug for DialIn {
 }
 
 impl DialIn {
+    /// The names the dial-in table under dyn holds now (each also in dyn's
+    /// own table while its socket lives).
+    pub fn names(&self) -> Vec<String> {
+        self.peers.names()
+    }
+
     /// The key this service proves to a dialing node (`key:<hex>`): what the
     /// node pins (`--trust`, or its known hosts at first contact).
     pub fn host_key(&self) -> &str {
@@ -166,24 +191,68 @@ impl DynActivation {
             since: now(),
             from: offer.from.clone(),
         };
+        let here = address_group(offer.from.as_deref());
         {
+            // Review M1: a rate an address and a key (each re-offer is a
+            // fresh pairing code), in the last minute.
+            let now = std::time::Instant::now();
+            let mut rates = self.inner.offer_rates.lock().unwrap();
+            for q in rates.values_mut() {
+                while q.front().is_some_and(|t| now.duration_since(*t) >= std::time::Duration::from_secs(60)) {
+                    q.pop_front();
+                }
+            }
+            rates.retain(|_, q| !q.is_empty());
+            let (by_address, by_key) = (format!("a:{here}"), format!("k:{}", offer.principal));
+            if rates.get(&by_address).map_or(0, |q| q.len()) >= o.dial_in_offers_per_minute_per_address {
+                return Decision::Refuse(refused("rate_limited", "too many offers from this address in the last minute: try again later"));
+            }
+            if rates.get(&by_key).map_or(0, |q| q.len()) >= o.dial_in_offers_per_minute_per_key {
+                return Decision::Refuse(refused("rate_limited", "too many offers by this key in the last minute: try again later"));
+            }
             let mut pending = self.inner.pending.lock().unwrap();
+            let mut gone: Vec<(Pending, &str)> = Vec::new();
             // One per key: a newer offer supersedes the older.
             let older: Vec<u64> = pending.iter().filter(|(_, p)| p.info.principal == offer.principal).map(|(s, _)| *s).collect();
             for s in older {
                 if let Some(p) = pending.remove(&s) {
-                    let _ = p.release.send(Err(refused("superseded", "a newer offer of the same key waits in its place")));
+                    gone.push((p, "a newer offer of the same key waits in its place"));
                 }
             }
-            if pending.len() >= o.dial_in_pending_max {
-                return Decision::Refuse(refused("pending_full", format!("{} offers wait already: try again later", pending.len())));
+            let count = |pending: &PendingTable, g: &str| pending.values().filter(|p| p.group == g).count();
+            let oldest_of = |pending: &PendingTable, g: &str| pending.values().filter(|p| p.group == g).map(|p| p.socket).min();
+            if count(&pending, &here) >= o.dial_in_pending_per_address {
+                // Past its address's share: that address's oldest gives way.
+                if let Some(p) = oldest_of(&pending, &here).and_then(|s| pending.remove(&s)) {
+                    gone.push((p, "a newer offer from the same address waits in its place"));
+                }
+            } else if pending.len() >= o.dial_in_pending_max {
+                // Full: the busiest address gives way, when it holds more than this one would.
+                let mut groups: BTreeMap<&str, usize> = BTreeMap::new();
+                for p in pending.values() {
+                    *groups.entry(p.group.as_str()).or_default() += 1;
+                }
+                let busiest = groups.iter().max_by_key(|(_, n)| **n).map(|(g, n)| (g.to_string(), *n));
+                match busiest {
+                    Some((g, n)) if g == here || n > count(&pending, &here) + 1 => {
+                        if let Some(p) = oldest_of(&pending, &g).and_then(|s| pending.remove(&s)) {
+                            gone.push((p, "the list is full, and the address it came from holds the most"));
+                        }
+                    }
+                    _ => {
+                        for (p, why) in gone {
+                            let _ = p.release.send(Err(refused("superseded", why)));
+                        }
+                        return Decision::Refuse(refused("pending_full", format!("{} offers wait already, from as many addresses: try again later", pending.len())));
+                    }
+                }
             }
-            // By address, not by port: one machine's sockets are one address.
-            let here = offer.from.as_deref().map(address_of);
-            if here.is_some() && pending.values().filter(|p| p.info.from.as_deref().map(address_of) == here).count() >= o.dial_in_pending_per_address {
-                return Decision::Refuse(refused("pending_full", "too many offers wait from this address"));
+            for (p, why) in gone {
+                let _ = p.release.send(Err(refused("superseded", why)));
             }
-            pending.insert(offer.socket, Pending { info, socket: offer.socket, release: tx });
+            pending.insert(offer.socket, Pending { info, socket: offer.socket, group: here.clone(), release: tx });
+            rates.entry(by_address).or_default().push_back(now);
+            rates.entry(by_key).or_default().push_back(now);
         }
         tracing::warn!(target: "plexus::audit", peer = %offer.name, principal = %offer.principal, from = ?offer.from, code = ?offer.code, "dyn: a dial-in offer waits for an operator (dyn.pending, dyn.admit)");
         let age = o.dial_in_pending_age;
@@ -238,6 +307,11 @@ impl DynActivation {
                 }
                 if let Err(message) = check_name(name) {
                     return DynEvent::Error { message };
+                }
+                // Review M2: an offer that waits with a pairing code is admitted
+                // by that code — the one its node shows — never by name and key.
+                if let Some(p) = self.inner.pending.lock().unwrap().values().find(|p| p.info.code.is_some() && (p.info.name == name || p.info.principal == key)) {
+                    return DynEvent::Error { message: format!("an offer waits for `{}` with a pairing code: admit it with `--code` as its node shows it (dyn.pending), never by name and key", p.info.name) };
                 }
                 let socket = self.inner.pending.lock().unwrap().values().find(|p| p.info.principal == key && p.info.name == name).map(|p| p.socket);
                 (name.to_string(), key.to_string(), socket)
@@ -376,14 +450,31 @@ impl Admission for DialAdmission {
             return Err(refused("unauthenticated", "its key is not its mount's identity"));
         }
         // NEST-16: a graft's needs, served by this service.
-        d.vet(&offer.name, child, None).map_err(|m| refused("needs_unmet", m))
+        d.vet(&offer.name, child, None).map_err(|m| refused("needs_unmet", m))?;
+        if let Some(h) = &d.inner.opts.dial_in_vetted {
+            (h.0)(&offer.name);
+        }
+        Ok(())
     }
 
-    fn mounted(&self, offer: &Offer, child: &RemoteChild, socket: &Arc<PeerSocket>) {
-        let Some(d) = self.dyn_() else { return };
+    fn mounted(&self, offer: &Offer, child: &RemoteChild, socket: &Arc<PeerSocket>) -> Result<(), OfferRefused> {
+        let d = self.dyn_().ok_or_else(|| refused("unavailable", "dyn is gone"))?;
         let name = offer.name.clone();
         let kind = PeerKind::DialIn { principal: offer.principal.clone(), since: now(), from: offer.from.clone() };
         let old = {
+            // Review L1: asked again under the lock `dyn.refuse` and
+            // `dyn.admit` write under, held while it is put in the table —
+            // a refusal is either seen here or finds it there.
+            let store = d.inner.store.lock().unwrap();
+            if let Some(why) = store.refused_keys.get(&offer.principal) {
+                return Err(refused("refused", format!("the key {} was refused while it was mounted ({why})", offer.principal)));
+            }
+            if let Some(why) = store.revoked.get(&name) {
+                return Err(refused("revoked", format!("`{name}` was revoked while it was mounted ({why})")));
+            }
+            if store.admitted.get(&name) != Some(&offer.principal) {
+                return Err(refused("refused", "no longer admitted"));
+            }
             let mut peers = d.inner.peers.lock().unwrap();
             let pin = child.identity().map(crate::PeerIdentity::from);
             peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), local: None, why: None, remounts: 0, expecting: None, pin, presented: None, dial: Some(Arc::clone(socket)) })
@@ -401,6 +492,7 @@ impl Admission for DialAdmission {
         if socket.is_closed() {
             d.drop_dialed(&name, socket.id());
         }
+        Ok(())
     }
 
     fn closed(&self, socket: u64, mount: Option<&str>, why: &str) {
@@ -435,3 +527,18 @@ impl DynActivation {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::address_group;
+
+    /// Review M1: an IPv6 site is one address (its /64); a port is not part of it.
+    #[test]
+    fn an_offer_is_counted_by_its_ipv4_address_or_its_ipv6_64() {
+        assert_eq!(address_group(Some("192.0.2.7:4100")), address_group(Some("192.0.2.7:4200")));
+        assert_ne!(address_group(Some("192.0.2.7:1")), address_group(Some("192.0.2.8:1")));
+        assert_eq!(address_group(Some("[2001:db8:1:2::1]:1")), address_group(Some("[2001:db8:1:2:ffff::9]:2")));
+        assert_ne!(address_group(Some("[2001:db8:1:2::1]:1")), address_group(Some("[2001:db8:1:3::1]:1")));
+        assert_eq!(address_group(Some("[::ffff:192.0.2.7]:1")), address_group(Some("192.0.2.7:1")));
+    }
+}
