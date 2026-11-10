@@ -157,12 +157,14 @@ pub(crate) fn consented(consent: Option<&Consent>, declared: Option<&[String]>) 
 }
 
 /// Every method path a mounted peer serves, below its mount: `m` for its
-/// own methods, `<path>.m` for each static child's.
+/// own methods, `<path>.m` for each static child's — but none its schema
+/// marks `everywhere` (KEEL-31): consent hands a role an ordinary method,
+/// never one held only on `*`.
 pub(crate) fn method_paths(child: &RemoteChild) -> Vec<String> {
     use plexus_core::plexus::Activation;
-    let mut out: Vec<String> = child.plugin_schema().methods.iter().map(|m| m.name.clone()).collect();
+    let mut out: Vec<String> = child.plugin_schema().methods.iter().filter(|m| !m.everywhere).map(|m| m.name.clone()).collect();
     for (path, schema) in child.static_child_schemas() {
-        out.extend(schema.methods.iter().map(|m| format!("{path}.{}", m.name)));
+        out.extend(schema.methods.iter().filter(|m| !m.everywhere).map(|m| format!("{path}.{}", m.name)));
     }
     out
 }

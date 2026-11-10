@@ -545,8 +545,16 @@ impl DynActivation {
         // closed to others, or nothing is read from or kept in it — and
         // `start` refuses, naming it.
         let refused = plexus_core::plexus::peer_token::ensure_private_dir(&opts.data_dir).err().map(|why| format!("the data directory: {why}"));
+        // KEEL-31: the backstop that does not depend on the macro, at the one
+        // constructor — a build whose whole-service methods lost their mark
+        // reads no key or consent, connects and grows nothing, and `start`
+        // refuses, whether or not it is ever called.
+        let refused = refused.or_else(|| {
+            let schema = <Self as plexus_core::plexus::Activation>::slot_schema()?;
+            plexus_core::plexus::require_everywhere(&schema, EVERYWHERE).err()
+        });
         if let Some(why) = &refused {
-            tracing::error!(target: "plexus::dyn", "{why}; no key or consent is read from it, and `start` refuses");
+            tracing::error!(target: "plexus::dyn", "{why}; no key or consent is read, no peer is connected or grown, and `start` refuses");
         }
         let signing = match &refused {
             None => Self::signing_key(&opts),
@@ -918,6 +926,9 @@ impl DynActivation {
         if let Some(why) = &self.inner.refused {
             return Err(why.clone());
         }
+        // KEEL-31: the backstop, again on the instance's own schema (`new`
+        // checked the one the build declares).
+        plexus_core::plexus::require_everywhere(&plexus_core::plexus::Activation::plugin_schema(self), EVERYWHERE)?;
         *self.inner.host.lock().unwrap() = Some(service.downgrade());
         if self.inner.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
@@ -1058,9 +1069,17 @@ impl DynActivation {
         if o.host.is_none() {
             o.host = self.inner.host.lock().unwrap().clone();
         }
+        // KEEL-32 (R3-1): dyn keeps a consent — nothing declared counts until
+        // `hold` applies it, from the handshake on.
+        o.consent_required = true;
         match kind {
             PeerKind::Ws { .. } => o.ping = o.ping.or(Some(self.inner.opts.liveness)),
-            PeerKind::Dendrite { .. } => o.timeout = o.timeout.max(self.inner.opts.dendrite_timeout),
+            PeerKind::Dendrite { via, .. } => {
+                o.timeout = o.timeout.max(self.inner.opts.dendrite_timeout);
+                // KEEL-32: the schemas it grows its clients from at its start
+                // (`--via-host`), before its needs are known — and no other.
+                o.schemas = via.iter().map(|t| format!("dyn.peer.{t}")).collect();
+            }
         }
         o
     }
@@ -1108,7 +1127,10 @@ impl DynActivation {
             }
         };
         // NEST-16: the remount is the same graft: checked again.
-        let mounted = match RemoteChild::connect(spec, self.child_options(&kind)).await {
+        // KEEL-32 (R3-1): a revoked peer is remounted revoked from its first
+        // byte (a fresh connect or grow with `replace` is what lifts it).
+        let revoked = self.inner.store.lock().unwrap().revoked.get(name).cloned();
+        let mounted = match RemoteChild::connect(spec, self.child_options(&kind).with_revoked(revoked)).await {
             Ok(child) => self.vet(name, &child, expecting.as_deref()).map(|_| child),
             Err(e) => Err(e.to_string()),
         };
@@ -1198,6 +1220,10 @@ impl DynActivation {
 
     /// Add (or replace) a peer and mount it; on failure nothing is kept.
     async fn add(&self, name: String, kind: PeerKind, replace: bool, expecting: Option<String>) -> DynEvent {
+        // KEEL-31 / KEEL-19: refused at construction — nothing connected or grown.
+        if let Some(message) = &self.inner.refused {
+            return DynEvent::Error { message: message.clone() };
+        }
         if let Err(message) = check_name(&name) {
             return DynEvent::Error { message };
         }
@@ -1453,6 +1479,12 @@ pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
     Ok(out)
 }
 
+/// KEEL-31: dyn's methods that act on the whole service — its admin writes,
+/// and its reads of every peer, consent and pin — each marked `everywhere`,
+/// which [`DynActivation::start`] checks.
+pub const EVERYWHERE: &[&str] =
+    &["connect", "grow", "disconnect", "consent", "consents", "revoke", "rotate_key", "pins", "repin", "peers", "names"];
+
 /// Runtime peers: connect services, grow dendrites, call them as
 /// `dyn.peer.<name>.<path>.<method>`.
 #[plexus_macros::activation(roles(viewer = ["peers", "names", "consents", "pins"]))]
@@ -1460,7 +1492,7 @@ impl DynActivation {
     /// Connect the service at `url` (a WebSocket) as the peer `name`; a taken
     /// name is refused unless `replace`. `wss://` anywhere, `ws://` only to
     /// loopback (`refused`, `insecure_transport`); its identity is pinned.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     ///
     /// `expecting` (NEST-16): an interface hash, a contract's stamp — the
     /// peer must serve exactly that interface, now and at every remount.
@@ -1474,7 +1506,7 @@ impl DynActivation {
     /// Grow a dendrite: `source` (its `index.ts`) served as the peer `name`,
     /// its clients grown toward `targets` (other peers, `weather` or
     /// `weather.forecasts`, each called back through this service).
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     ///
     /// `expecting` (NEST-16): as `connect`'s.
     pub async fn grow(&self, name: String, source: String, targets: Vec<String>, replace: Option<bool>, expecting: Option<String>) -> DynEvent {
@@ -1495,7 +1527,7 @@ impl DynActivation {
     }
 
     /// Let go of the peer `name` (a dendrite's process ends with its last call).
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn disconnect(&self, name: String) -> DynEvent {
         let gone = self.inner.peers.lock().unwrap().remove(&name);
         match gone {
@@ -1512,7 +1544,7 @@ impl DynActivation {
     /// its declared needs it may call back up through this service, each
     /// `method` or `method@scope`; `callers`: the roles whose holders may
     /// call into it. Replaces what it held; empty lists withdraw it.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn consent(&self, peer: String, needs: Option<Vec<String>>, callers: Option<Vec<String>>) -> DynEvent {
         match self.set_consent(&peer, needs.unwrap_or_default(), callers.unwrap_or_default()) {
             Ok(c) => DynEvent::Consented { peer, needs: c.needs, callers: c.callers },
@@ -1522,7 +1554,7 @@ impl DynActivation {
 
     /// DYNAUTH-5: each peer's registration — its key, what it declares it
     /// needs — and what is consented, what is still pending.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn consents(&self) -> impl Stream<Item = ConsentInfo> + Send + 'static {
         futures::stream::iter(self.consent_list())
     }
@@ -1531,7 +1563,7 @@ impl DynActivation {
     /// token minted), every call it is making back ends, its consent goes;
     /// listed as revoked until it is connected or grown again with
     /// `replace`. Tokens already issued expire within 60 s.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn revoke(&self, peer: String, why: Option<String>) -> DynEvent {
         let why = why.unwrap_or_else(|| "revoked by an admin".into());
         match self.revoke_peer(&peer, &why) {
@@ -1542,7 +1574,7 @@ impl DynActivation {
 
     /// DYNAUTH-7: rotate the signing key: a new one signs from now, the old
     /// one stays in `dyn.jwks` for one token lifetime, then goes.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn rotate_key(&self) -> DynEvent {
         match self.rotate_signing_key() {
             Ok((kid, previous)) => DynEvent::Rotated { kid, previous },
@@ -1586,7 +1618,7 @@ impl DynActivation {
     /// NEST-21: every peer's pin — the identity pinned and its fingerprint,
     /// and the identity it last presented and was refused for, with the
     /// fingerprint `dyn.repin` takes.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn pins(&self) -> impl Stream<Item = PinInfo> + Send + 'static {
         futures::stream::iter(self.pin_list())
     }
@@ -1595,20 +1627,20 @@ impl DynActivation {
     /// (`identity_changed`) — only when `fingerprint` is exactly that
     /// identity's (`dyn.pins`' `presented_fingerprint`, checked against the
     /// peer's own word), so nobody re-pins blind — and mount it again.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn repin(&self, name: String, fingerprint: String) -> DynEvent {
         self.repin_peer(&name, &fingerprint).await
     }
 
     /// Every peer: its kind, whether it is up, its interface's hash, its
     /// restarts, open calls and calls.
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn peers(&self) -> impl Stream<Item = PeerInfo> + Send + 'static {
         futures::stream::iter(self.list())
     }
 
     /// Every peer's name (the slot's list: a slot lists names).
-    #[plexus_macros::method]
+    #[plexus_macros::method(everywhere)]
     pub async fn names(&self) -> impl Stream<Item = String> + Send + 'static {
         futures::stream::iter(self.list().into_iter().map(|p| p.name))
     }
@@ -1617,5 +1649,21 @@ impl DynActivation {
     #[plexus_macros::peer(list = names)]
     async fn peer(&self, name: &str) -> Result<Box<dyn Peer>, PeerError> {
         self.get(name).await.map(|c| Box::new(c) as Box<dyn Peer>)
+    }
+}
+
+#[cfg(test)]
+mod r3_1 {
+    use super::*;
+
+    /// KEEL-32 (R3-1): every mount dyn makes keeps a consent from its
+    /// handshake on — nothing a peer declares counts until `hold`.
+    #[test]
+    fn every_mount_holds_its_consent_from_the_handshake() {
+        let data = tempfile::tempdir().unwrap();
+        let dyn_ = DynActivation::new(DynOptions { data_dir: data.path().join("dyn"), dendrite: data.path().join("no-dendrite"), ..DynOptions::default() });
+        for kind in [PeerKind::Ws { url: "ws://127.0.0.1:1".into() }, PeerKind::Dendrite { dir: "d".into(), via: vec!["w".into()] }] {
+            assert!(dyn_.child_options(&kind).consent_required, "{kind:?}");
+        }
     }
 }
