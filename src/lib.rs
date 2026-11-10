@@ -1613,7 +1613,7 @@ pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
 /// and its reads of every peer, consent and pin — each marked `everywhere`,
 /// which [`DynActivation::start`] checks.
 pub const EVERYWHERE: &[&str] =
-    &["connect", "grow", "disconnect", "consent", "consents", "revoke", "rotate_key", "pins", "repin", "peers", "names", "admit", "refuse", "pending"];
+    &["connect", "grow", "disconnect", "consent", "consents", "revoke", "admit", "refuse", "pending", "rotate_key", "pins", "repin", "peers", "names"];
 
 /// Runtime peers: connect services, grow dendrites, call them as
 /// `dyn.peer.<name>.<path>.<method>`.
