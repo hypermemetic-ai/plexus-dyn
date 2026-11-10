@@ -1,5 +1,79 @@
 # Changelog
 
+## [0.2.1]
+
+On plexus-core 0.11.1.
+
+KEEL-19 (security, High): **`dyn.exchange` is decided where a call back is
+decided.** In 0.2.0 it checked only that the audience was a keyed,
+unrevoked peer. Now the presenter — the subject token's audience, proven by
+its proof — must be a peer mounted here, not revoked, holding a consented
+need that covers the audience and the method asked
+(`dyn.peer.<audience>.<m>` for the audience's `<backend>.<m>`, or
+`<audience>.<m>` for a peer at the top level), held by the subject token
+(plexus-core's `RemoteChild::may_exchange`). `method` is required. The
+token's scope is `method` on the scopes both the subject holds that need on
+and consent allows, narrowed to `scope` when asked; it is bound to the
+presenter's key, so the audience takes it only with the presenter's proof;
+and a subject token is exchanged once per audience and method. A refusal's
+message names its reason in brackets (`[not_consented]`, `[presenter]`,
+`[revoked]`, `[again]`, `[proof]`, `[subject]`, `[audience]`) and is
+audited (`plexus::audit`). A revoked presenter is refused at once.
+
+Second pass: **a key is mounted once.** A peer proving a key another peer
+here holds (mounted, or pinned) is refused — `refused` with
+`Refusal::IdentityChanged`, its message starting `key_in_use:`, `old` the
+holder's pin, audited — at `connect`/`grow` and at a remount (checked again
+where the entry is reserved, under one hold of the lock: two connects
+racing on one key mount one); so a token addressed to a key, and an
+exchange's presenter found by its key, name one peer, and a revoked peer's
+key gets no sibling mount. With plexus-core 0.11.1 a keyed peer is served on
+`ChildPeer::connection` (the tests' WebSocket peers are served as proven
+`service:dyn`), every forwarded hop carries the service's proof, and a
+consent narrowed under an open call narrows its next call back. Both sides
+upgrade together (plexus-core's CHANGELOG).
+
+Third pass: **`dyn` dials with a key by default** — `<data_dir>/dial.key`
+(0600, made when missing; `DynOptions::child.key` overrides), its own, not
+the token-signing `dyn.key`: a peer trusts the dial key as the service
+acting for others, the JWKS key signs tokens and forward proofs, and
+rotating one changes only its role (`dyn.rotate_key` leaves the dial
+identity; a new dial key must be re-trusted by the peers). Its principal is
+`DynActivation::dial_principal()`; without a dial key no keyed peer mounts.
+The dial key is denied to every dendrite. The tests serve keyed peers with
+plexus-core's `serve_child_ws` (the upgrade's key proof verified), never on
+a name.
+
+Fourth pass: **the data directory is the user's own** (KEEL-25, folded
+in). The default is `$XDG_DATA_HOME/plexus-dyn`, else
+`~/.local/share/plexus-dyn` (with neither, `<tmp>/plexus-dyn-<uid>`), no
+longer `/tmp/plexus-dyn`; it is made 0700, and one that is a link, another
+user's, or open to group or others is refused — `start` answers why,
+naming it, and no key or consent is read from or kept in it.
+`consent.json` and the keys are read only as the user's own, 0600, never
+through a link. A connect refused for a key another peer holds is refused
+before it touches the consent of the name it gave (`register`/`hold` after
+the entry is reserved; a consent kept for another key is no longer read
+for a peer, at `hold` nor by the gate's roles). A refused data directory is
+a behaviour change: an existing one made 0755 by an earlier version (e.g.
+plexus-ui's `<data-dir>/dyn`) is refused until `chmod 700`.
+
+Fifth pass: `dyn` dials its peers as the reserved agent
+`plexus.child-dial` (plexus-core 0.11.1's `ws::dial`), which a keyed peer's
+`serve_child_ws` requires, so a peer on 0.11.1 refuses a 0.2.0 `dyn`'s
+dial: upgrade `dyn` and its keyed peers together. A peer's upgrade ledger
+refuses when full (4096 proofs a minute) instead of evicting. The example
+prints the dial principal at start (`dial principal: key:…`), which each
+keyed peer trusts. Requires plexus-macros 0.11.1 (plexus-auth-core stays
+0.3.1). A service behind key sign-in is mounted as before: its sign-in
+takes the dial proof as `dyn`'s key.
+
+**Moving from 0.2.0:** upgrade with plexus-core 0.11.1 on both sides; give
+each keyed peer `dial_principal()` to trust and serve it with
+`serve_child_ws`; `chmod 700` a data directory an earlier version made
+group- or world-readable, or move it (the default moved from
+`/tmp/plexus-dyn`, whose keys and consent are not carried over).
+
 ## [0.2.0] — unreleased
 
 On plexus-core, plexus-macros and plexus-client 0.11 (NEST-24): a new minor,

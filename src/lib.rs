@@ -192,10 +192,30 @@ impl std::fmt::Debug for Audit {
     }
 }
 
+/// KEEL-19 (P5, KEEL-25): the user's own data directory —
+/// `$XDG_DATA_HOME/plexus-dyn`, else `~/.local/share/plexus-dyn`; with
+/// neither, `<tmp>/plexus-dyn-<uid>`. Made 0700; refused at start when it is
+/// not the user's or is open to others (`DynActivation::start`).
+fn default_data_dir() -> PathBuf {
+    let from = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(x) = from("XDG_DATA_HOME") {
+        return x.join("plexus-dyn");
+    }
+    if let Some(h) = from("HOME") {
+        return h.join(".local/share/plexus-dyn");
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    #[cfg(unix)]
+    let me = format!("plexus-dyn-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let me = "plexus-dyn".to_string();
+    std::env::temp_dir().join(me)
+}
+
 impl Default for DynOptions {
     fn default() -> Self {
         Self {
-            data_dir: std::env::temp_dir().join("plexus-dyn"),
+            data_dir: default_data_dir(),
             dendrite: PathBuf::from("plexus-dendrite"),
             child: ChildOptions::for_service("dyn"),
             dendrite_timeout: Duration::from_secs(60),
@@ -346,6 +366,24 @@ pub enum Refusal {
     NotPresented,
 }
 
+/// KEEL-19: the peer other than `name` that holds `key` — mounted under it,
+/// or pinned to it — if one does. One key is one mount: a token addressed to
+/// a key, and an exchange's presenter found by its key, name one peer.
+fn key_held_by(peers: &BTreeMap<String, Entry>, name: &str, key: Option<&str>) -> Option<String> {
+    let key = key?;
+    peers
+        .iter()
+        .find(|(n, e)| n.as_str() != name && (e.child.as_ref().and_then(|c| c.peer_key()) == Some(key) || e.pin.as_ref().and_then(|p| p.key.as_deref()) == Some(key)))
+        .map(|(n, _)| n.clone())
+}
+
+/// KEEL-19: the refusal of a key another peer holds. Said as
+/// `Refusal::IdentityChanged` (the identity it proved is another peer's),
+/// its message starting `key_in_use:`, `old` the holder's pin.
+fn key_in_use(name: &str, key: &str, other: &str) -> String {
+    format!("key_in_use: `{name}` proved the key {key}, which `{other}` holds here: one key is one peer (disconnect `{other}` first)")
+}
+
 /// DYNAUTH-6: what `dyn.exchange` answers (RFC 8693 §2.2's response, as
 /// a stream item).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -440,6 +478,14 @@ struct Inner {
     issuer: Arc<TokenIssuer>,
     /// DYNAUTH-6: the exchange proofs seen, each once.
     proofs: plexus_core::plexus::peer_token::ProofCache,
+    /// KEEL-19: the key `dyn` dials its peers with when `opts.child.key`
+    /// names none — `<data_dir>/dial.key` (0600, made when missing), its
+    /// own, not the token-signing key: a peer trusts it as the service
+    /// acting for others, and rotating either changes only its own role.
+    /// `None` when it could not be read or made: then no keyed peer mounts.
+    dial_key: Option<PathBuf>,
+    /// KEEL-19 (P5): why the data directory is refused, if it is.
+    refused: Option<String>,
     /// NEST-21: where the settings are read: `DynOptions::config`, or the
     /// service's once started.
     config: Mutex<Config>,
@@ -456,6 +502,10 @@ impl consent::ConsentSource for Inner {
                 continue;
             }
             let Some(child) = peers.get(name).and_then(|e| e.child.as_ref()) else { continue };
+            // KEEL-19: a consent given for another key is another client's.
+            if c.key.as_deref() != child.peer_key() {
+                continue;
+            }
             for m in consent::method_paths(child) {
                 out.push(format!("dyn.peer.{name}.{m}"));
                 if top.contains(name) {
@@ -491,12 +541,25 @@ impl DynActivation {
     /// `dyn` with `opts`.
     pub fn new(opts: DynOptions) -> Self {
         let config = opts.config.clone().unwrap_or_default();
-        let mut issuer = TokenIssuer::new(Self::signing_key(&opts));
+        // KEEL-19 (P5, KEEL-25): the data directory is the user's own and
+        // closed to others, or nothing is read from or kept in it — and
+        // `start` refuses, naming it.
+        let refused = plexus_core::plexus::peer_token::ensure_private_dir(&opts.data_dir).err().map(|why| format!("the data directory: {why}"));
+        if let Some(why) = &refused {
+            tracing::error!(target: "plexus::dyn", "{why}; no key or consent is read from it, and `start` refuses");
+        }
+        let signing = match &refused {
+            None => Self::signing_key(&opts),
+            Some(_) => PeerKey::generate(),
+        };
+        let mut issuer = TokenIssuer::new(signing);
         if let Some(Audit(sink)) = &opts.audit {
             issuer = issuer.with_audit(Arc::clone(sink));
         }
         let issuer = Arc::new(issuer);
-        Self {
+        let dial_key = if refused.is_none() { Self::dial_key(&opts) } else { None };
+        let load = refused.is_none();
+        let this = Self {
             inner: Arc::new(Inner {
                 opts,
                 peers: Mutex::default(),
@@ -507,11 +570,13 @@ impl DynActivation {
                 store: Mutex::new(consent::Store::default()),
                 issuer,
                 proofs: Default::default(),
+                dial_key,
+                refused,
                 config: Mutex::new(config.clone()),
             }),
-        }
-        .loaded()
-        .adopted(config)
+        };
+        let this = if load { this.loaded() } else { this };
+        this.adopted(config)
     }
 
     /// NEST-21: the configuration read now.
@@ -561,6 +626,28 @@ impl DynActivation {
         opts.key_file.clone().unwrap_or_else(|| opts.data_dir.join("dyn.key"))
     }
 
+    /// KEEL-19: the dial key's file — `opts.child.key` when it names one,
+    /// else `<data_dir>/dial.key`, made (0600) when missing.
+    fn dial_key(opts: &DynOptions) -> Option<PathBuf> {
+        if let Some(k) = &opts.child.key {
+            return Some(k.clone());
+        }
+        let path = opts.data_dir.join("dial.key");
+        match PeerKey::load_or_create(&path) {
+            Ok(_) => Some(path),
+            Err(why) => {
+                tracing::error!(target: "plexus::dyn", "the dial key: {why}; dialing with none, so no keyed peer is mounted");
+                None
+            }
+        }
+    }
+
+    /// KEEL-19: the principal `dyn`'s dial proves to its peers (`key:<hex>`),
+    /// what a keyed peer trusts to act for others; `None` without a dial key.
+    pub fn dial_principal(&self) -> Option<String> {
+        self.inner.dial_key.as_deref().and_then(|p| plexus_core::plexus::remote_child::key_principal(p).ok())
+    }
+
     fn signing_key(opts: &DynOptions) -> PeerKey {
         let path = Self::key_path(opts);
         PeerKey::load_or_create(&path).unwrap_or_else(|why| {
@@ -608,6 +695,9 @@ impl DynActivation {
     /// `dyn.jwks` for one token lifetime and the skew. The key file is
     /// replaced. Answers the new key's id and the old one's.
     pub fn rotate_signing_key(&self) -> Result<(String, String), String> {
+        if let Some(why) = &self.inner.refused {
+            return Err(why.clone());
+        }
         let old = self.inner.issuer.kid();
         let new = PeerKey::generate();
         new.save(&Self::key_path(&self.inner.opts))?;
@@ -617,14 +707,82 @@ impl DynActivation {
     }
 
     /// DYNAUTH-6: [`DynActivation::exchange`]'s work.
+    ///
+    /// KEEL-19: decided where a call back is decided. The presenter — the
+    /// subject token's audience, proven by its proof — must be a peer
+    /// mounted here, not revoked, holding a consented need that covers the
+    /// audience and the method asked (`dyn.peer.<audience>.<m>` for the
+    /// audience's `<backend>.<m>`, or `<audience>.<m>` when it is served at
+    /// the top level), held by the subject token: `RemoteChild::may_exchange`,
+    /// which asks the one function the presenter's calls back are asked by.
+    /// The token is bound to the presenter's key, so the audience takes it
+    /// only with the presenter's proof; a subject token is exchanged once
+    /// per audience and method. A refusal says its reason in brackets
+    /// (`[not_consented]`) and is audited.
     pub fn exchange_for(&self, subject: &str, proof: &str, audience: &str, scope: Option<&[String]>, method: &str) -> Result<(String, plexus_core::plexus::peer_token::PeerClaims), String> {
-        let child = self.inner.peers.lock().unwrap().get(audience).and_then(|e| e.child.clone());
-        let key = child.as_ref().and_then(|c| c.peer_key().map(str::to_string)).ok_or_else(|| format!("no connected peer `{audience}` that proved a key: a token is only exchanged for one"))?;
-        if let Some(why) = self.inner.store.lock().unwrap().revoked.get(audience) {
-            return Err(format!("`{audience}` is revoked ({why})"));
-        }
+        use plexus_core::plexus::peer_token::{narrow, ExchangeRefusal as R, Onward, PeerClaims, TokenError};
+        let reason = std::cell::Cell::new(None::<R>);
+        let decide = |presented: &PeerClaims| -> Result<Onward, (R, String)> {
+            let refuse = |r: R, why: String| {
+                reason.set(Some(r));
+                (r, why)
+            };
+            let (target, presenter) = {
+                let peers = self.inner.peers.lock().unwrap();
+                let target = peers.get(audience).and_then(|e| e.child.clone());
+                let presenter = peers.iter().find_map(|(n, e)| e.child.clone().filter(|c| c.peer_key() == Some(presented.aud.as_str())).map(|c| (n.clone(), c)));
+                (target, presenter)
+            };
+            let Some((target, key)) = target.and_then(|c| c.peer_key().map(str::to_string).map(|k| (c, k))) else {
+                return Err(refuse(R::Audience, format!("no connected peer `{audience}` that proved a key: a token is only exchanged for one")));
+            };
+            let Some((name, presenter)) = presenter else {
+                return Err(refuse(R::Presenter, "the token's holder is not a peer mounted in this service: only a mounted peer's token is exchanged".into()));
+            };
+            {
+                let store = self.inner.store.lock().unwrap();
+                for (who, n) in [("the presenter", name.as_str()), ("the audience", audience)] {
+                    if let Some(why) = store.revoked.get(n) {
+                        return Err(refuse(R::Revoked, format!("{who} `{n}` is revoked ({why})")));
+                    }
+                }
+            }
+            let backend = target.identity().map(|i| i.backend.clone()).unwrap_or_else(|| audience.to_string());
+            let Some(m) = method.strip_prefix(&format!("{backend}.")).filter(|m| !m.is_empty()) else {
+                return Err(refuse(R::NotConsented, format!("`{method}` is not a method of `{audience}`, whose methods are `{backend}.…`: an exchange names the method it is for")));
+            };
+            let mut needs = vec![format!("dyn.peer.{audience}.{m}")];
+            if self.inner.top.lock().unwrap().contains(audience) {
+                needs.push(format!("{audience}.{m}"));
+            }
+            let mut why = String::new();
+            for need in &needs {
+                match presenter.may_exchange(need, method, presented) {
+                    Ok(held) => {
+                        let scope = match scope {
+                            Some(asked) => narrow(Some(asked), &held),
+                            None => held,
+                        };
+                        if scope.is_empty() {
+                            return Err(refuse(R::NotConsented, format!("the scope asked is not within what `{name}` may reach of `{audience}`")));
+                        }
+                        return Ok(Onward { name: audience.to_string(), peer_key: Some(key), scope });
+                    }
+                    Err(w) => why = w,
+                }
+            }
+            let r = if presenter.revoked().is_some() { R::Revoked } else { R::NotConsented };
+            Err(refuse(r, format!("`{name}` may not reach `{}`: {why}", needs[0])))
+        };
         let call = uuid::Uuid::new_v4().to_string();
-        self.inner.issuer.exchange(subject, Some(proof), audience, Some(key), scope, &call, method, &self.inner.proofs).map_err(|e| format!("the exchange is refused: {e}"))
+        self.inner.issuer.exchange_decided(subject, Some(proof), audience, &call, method, &self.inner.proofs, decide).map_err(|e| {
+            let r = reason.get().unwrap_or(match &e {
+                TokenError::Proof(_) => R::Proof,
+                TokenError::Refused(_) => R::Again,
+                _ => R::Subject,
+            });
+            format!("the exchange is refused [{r}]: {e}")
+        })
     }
 
     /// DYNAUTH-5: the consent kept in the data directory, read at start.
@@ -641,6 +799,9 @@ impl DynActivation {
     }
 
     fn save_store(&self) -> Result<(), String> {
+        if let Some(why) = &self.inner.refused {
+            return Err(why.clone());
+        }
         let s = self.inner.store.lock().unwrap().clone();
         s.save(&self.store_path())
     }
@@ -667,7 +828,9 @@ impl DynActivation {
         }
         let declared = Self::declared(child);
         let store = self.inner.store.lock().unwrap();
-        child.set_consent(Some(consent::consented(store.consents.get(name), declared.as_deref())));
+        // KEEL-19: a consent given for another key is another client's.
+        let given = store.consents.get(name).filter(|c| c.key.as_deref() == child.peer_key());
+        child.set_consent(Some(consent::consented(given, declared.as_deref())));
     }
 
     /// DYNAUTH-5: a new registration of `name` under `key` — the consent
@@ -752,6 +915,9 @@ impl DynActivation {
     /// connected (one that fails listed down), and the liveness task. Call
     /// once the service is built; safe to call again (it does nothing).
     pub async fn start(&self, service: &DynamicHub) -> Result<(), String> {
+        if let Some(why) = &self.inner.refused {
+            return Err(why.clone());
+        }
         // KEEL-31: a backstop that does not depend on the macro — refuse to
         // start if a method that acts on the whole service lost its mark.
         plexus_core::plexus::require_everywhere(&plexus_core::plexus::Activation::plugin_schema(self), EVERYWHERE)?;
@@ -884,6 +1050,11 @@ impl DynActivation {
     fn child_options(&self, kind: &PeerKind) -> ChildOptions {
         // NEST-21: the child.* and transport.tls_roots settings, read at each mount.
         let mut o = self.inner.opts.child.clone().configured(&self.config());
+        // KEEL-19: dial with a key by default, so a keyed peer's proof is
+        // made for a principal its transport proved.
+        if o.key.is_none() {
+            o.key = self.inner.dial_key.clone();
+        }
         if self.inner.opts.tokens {
             o.tokens = Some(Arc::clone(&self.inner.issuer));
         }
@@ -946,6 +1117,15 @@ impl DynActivation {
         };
         let repin_on_valid_cert = self.config().get(&settings::DYN_REPIN_ON_VALID_CERT);
         let mut peers = self.inner.peers.lock().unwrap();
+        // KEEL-19: one key, one mount.
+        let mounted = mounted.and_then(|child| match key_held_by(&peers, name, child.peer_key()) {
+            Some(other) => {
+                let why = key_in_use(name, child.peer_key().unwrap_or_default(), &other);
+                tracing::warn!(target: "plexus::audit", peer = %name, holder = %other, key = %child.peer_key().unwrap_or_default(), "dyn refused a mount: its key is another peer's");
+                Err(why)
+            }
+            None => Ok(child),
+        });
         let Some(e) = peers.get_mut(name) else { return Err(format!("`{name}` was disconnected while it was mounted")) };
         match mounted {
             Ok(child) => {
@@ -1043,10 +1223,35 @@ impl DynActivation {
                 if let Err(message) = self.vet(&name, &child, expecting.as_deref()) {
                     return DynEvent::Error { message };
                 }
+                // KEEL-19: one key, one mount — refused, typed and audited:
+                // checked where the entry is reserved, under one hold of the
+                // lock (two connects racing on one key mount one).
+                let refuse = |peers: &BTreeMap<String, Entry>| {
+                    let other = key_held_by(peers, &name, child.peer_key())?;
+                    let key = child.peer_key().unwrap_or_default().to_string();
+                    tracing::warn!(target: "plexus::audit", peer = %name, holder = %other, %key, "dyn refused a mount: its key is another peer's");
+                    let old = peers.get(&other).and_then(|e| e.pin.clone());
+                    Some(DynEvent::Refused { reason: Refusal::IdentityChanged, message: key_in_use(&name, &key, &other), old, presented: child.identity().map(PeerIdentity::from) })
+                };
                 let schema = plexus_core::plexus::Activation::plugin_schema(&child);
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
                 let pin = child.identity().map(PeerIdentity::from);
+                // Nothing upward until it is held to its consent below
+                // (fail closed while it is reserved).
+                child.set_consent(Some(Vec::new()));
+                {
+                    let mut peers = self.inner.peers.lock().unwrap();
+                    if let Some(refused) = refuse(&peers) {
+                        return refused;
+                    }
+                    peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin, presented: None });
+                }
+                // DYNAUTH-5: registered — its key and needs — and held to
+                // what is consented for it; only once it holds its name, so
+                // a connect refused above dropped nobody's consent.
+                self.register(&name, child.peer_key());
+                self.hold(&name, &child);
                 // DYNAUTH-7: an admin connecting or growing it again is a
                 // new registration: a revocation ends here.
                 if self.inner.store.lock().unwrap().revoked.remove(&name).is_some() {
@@ -1054,11 +1259,6 @@ impl DynActivation {
                         tracing::error!(target: "plexus::dyn", "{why}");
                     }
                 }
-                // DYNAUTH-5: registered — its key and needs — and held to
-                // what is consented for it.
-                self.register(&name, child.peer_key());
-                self.hold(&name, &child);
-                self.inner.peers.lock().unwrap().insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin, presented: None });
                 if let Err(message) = self.surface(&name, &child) {
                     self.inner.peers.lock().unwrap().remove(&name);
                     return DynEvent::Error { message };
@@ -1180,6 +1380,8 @@ impl DynActivation {
         let o = &self.inner.opts;
         let mut out = Containment::default_deny(&o.data_dir);
         out.extend(o.child.key.iter().cloned());
+        // KEEL-19: the dial key, wherever it is kept.
+        out.extend(self.inner.dial_key.iter().cloned());
         // DYNAUTH-12: the signing key, wherever it is kept.
         out.extend(o.key_file.iter().cloned());
         out.extend(o.contain.deny.iter().cloned());
@@ -1361,9 +1563,14 @@ impl DynActivation {
     /// service minted for a peer, presented by that peer with `proof` (its
     /// proof of possession for method `exchange` under the token's `call`),
     /// becomes a token for the connected peer `audience` (one that proved a
-    /// key): the same `sub`, the presenter added to `act`, `scope` the one
-    /// asked (all of the subject's when absent) narrowed to the subject's,
-    /// never wider. A token bound to no key (a pipe's) is not exchanged.
+    /// key) and `method` (the audience's, `<backend>.<m>`): the same `sub`,
+    /// the presenter added to `act`. KEEL-19: only for a presenter mounted
+    /// here, not revoked, consented to reach `dyn.peer.<audience>.<m>`; its
+    /// scope `method` where the subject holds that need and consent allows,
+    /// narrowed to `scope` when asked; bound to the presenter's key (the
+    /// audience takes it only with the presenter's proof); once per subject,
+    /// audience and method. A token bound to no key (a pipe's) is not
+    /// exchanged.
     #[plexus_macros::method(public)]
     pub async fn exchange(&self, subject_token: String, proof: String, audience: String, scope: Option<Vec<String>>, method: Option<String>) -> ExchangeEvent {
         match self.exchange_for(&subject_token, &proof, &audience, scope.as_deref(), method.as_deref().unwrap_or_default()) {

@@ -48,7 +48,7 @@ fn who(p: &str, ceiling: Option<&[&str]>) -> AuthContext {
 async fn host() -> (Arc<DynamicHub>, tempfile::TempDir) {
     let data = tempfile::tempdir().unwrap();
     let opts = DynOptions {
-        data_dir: data.path().to_path_buf(),
+        data_dir: data.path().join("dyn"),
         dendrite: data.path().join("no-dendrite"),
         liveness: Duration::from_secs(3600),
         ..DynOptions::default()
@@ -140,7 +140,7 @@ async fn a_scoped_viewer_reads_no_service_wide_list() {
 async fn dyn_refuses_to_start_without_its_marks() {
     use plexus_core::plexus::Activation;
     let data = tempfile::tempdir().unwrap();
-    let dyn_ = DynActivation::new(DynOptions { data_dir: data.path().to_path_buf(), ..DynOptions::default() });
+    let dyn_ = DynActivation::new(DynOptions { data_dir: data.path().join("dyn"), ..DynOptions::default() });
     let mut schema = dyn_.plugin_schema();
     assert!(plexus_core::plexus::require_everywhere(&schema, plexus_dyn::EVERYWHERE).is_ok());
     for m in schema.methods.iter_mut().filter(|m| m.name == "grow") {

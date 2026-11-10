@@ -1,6 +1,6 @@
 [package]
 name = "plexus-dyn"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "A Plexus activation that connects to other services at runtime and grows TypeScript dendrites, each served as a peer: dyn.peer.<name>.<path>.<method>."
@@ -17,7 +17,9 @@ keywords = ["plexus", "rpc", "peer", "dendrite"]
 # 0.11.0 — needs checked at a graft, `Parent`, the narrowed calls back.
 # DYNAUTH-8: `child-wss` — a peer beyond loopback is reached by wss://, its
 # certificate validated and its key pinned.
-plexus-core = { version = "0.11.0", features = ["child-wss"] }
+# KEEL-19: 0.11.1 — exchange decided by the service (`exchange_decided`,
+# `RemoteChild::may_exchange`), tokens bound to their presenter.
+plexus-core = { version = "0.11.1", features = ["child-wss"] }
 plexus-macros = "0.11.1"
 plexus-client = "0.11.0"
 # What #[plexus_macros::activation] expands to names these crates.
@@ -39,6 +41,10 @@ tracing = "0.1"
 # DYNAUTH-9: a grown dendrite runs under a Landlock ruleset (the launcher,
 # `plexus-dyn-contain`). landlock 0.4.7 knows ABI 9 (Linux 7.1: a UNIX
 # socket by path); an older kernel is met best-effort.
+# KEEL-19 (KEEL-25): the default data directory names the effective user.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 
