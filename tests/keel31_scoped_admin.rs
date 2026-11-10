@@ -149,3 +149,25 @@ async fn dyn_refuses_to_start_without_its_marks() {
     let why = plexus_core::plexus::require_everywhere(&schema, plexus_dyn::EVERYWHERE).unwrap_err();
     assert!(why.contains("dyn.grow"), "{why}");
 }
+
+/// KEEL-31 (third pass): the backstop runs at construction, so a host that
+/// never calls `start` is held too — a `dyn` refused there connects and
+/// grows nothing. Shown with the refusal construction shares (a data
+/// directory open to others); a build that lost a mark is refused the same
+/// way, naming the methods.
+#[tokio::test]
+async fn a_refused_dyn_connects_nothing_unstarted() {
+    use std::os::unix::fs::PermissionsExt;
+    let data = tempfile::tempdir().unwrap();
+    let open = data.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dyn_ = DynActivation::new(DynOptions { data_dir: open, dendrite: data.path().join("no-dendrite"), ..DynOptions::default() });
+    let got = serde_json::to_value(dyn_.connect("x".into(), "ws://127.0.0.1:1".into(), None, None).await).unwrap();
+    assert_eq!(got["type"], "error", "{got}");
+    assert!(got["message"].as_str().unwrap().contains("data directory"), "{got}");
+    // This build: every mark there, nothing refused for it.
+    let fine = DynActivation::new(DynOptions { data_dir: data.path().join("dyn"), dendrite: data.path().join("no-dendrite"), ..DynOptions::default() });
+    let got = serde_json::to_value(fine.connect("x".into(), "ws://127.0.0.1:1".into(), None, None).await).unwrap();
+    assert!(!got.to_string().contains("must be marked `everywhere`"), "{got}");
+}

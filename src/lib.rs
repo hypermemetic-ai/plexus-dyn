@@ -545,8 +545,16 @@ impl DynActivation {
         // closed to others, or nothing is read from or kept in it — and
         // `start` refuses, naming it.
         let refused = plexus_core::plexus::peer_token::ensure_private_dir(&opts.data_dir).err().map(|why| format!("the data directory: {why}"));
+        // KEEL-31: the backstop that does not depend on the macro, at the one
+        // constructor — a build whose whole-service methods lost their mark
+        // reads no key or consent, connects and grows nothing, and `start`
+        // refuses, whether or not it is ever called.
+        let refused = refused.or_else(|| {
+            let schema = <Self as plexus_core::plexus::Activation>::slot_schema()?;
+            plexus_core::plexus::require_everywhere(&schema, EVERYWHERE).err()
+        });
         if let Some(why) = &refused {
-            tracing::error!(target: "plexus::dyn", "{why}; no key or consent is read from it, and `start` refuses");
+            tracing::error!(target: "plexus::dyn", "{why}; no key or consent is read, no peer is connected or grown, and `start` refuses");
         }
         let signing = match &refused {
             None => Self::signing_key(&opts),
@@ -918,8 +926,8 @@ impl DynActivation {
         if let Some(why) = &self.inner.refused {
             return Err(why.clone());
         }
-        // KEEL-31: a backstop that does not depend on the macro — refuse to
-        // start if a method that acts on the whole service lost its mark.
+        // KEEL-31: the backstop, again on the instance's own schema (`new`
+        // checked the one the build declares).
         plexus_core::plexus::require_everywhere(&plexus_core::plexus::Activation::plugin_schema(self), EVERYWHERE)?;
         *self.inner.host.lock().unwrap() = Some(service.downgrade());
         if self.inner.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -1206,6 +1214,10 @@ impl DynActivation {
 
     /// Add (or replace) a peer and mount it; on failure nothing is kept.
     async fn add(&self, name: String, kind: PeerKind, replace: bool, expecting: Option<String>) -> DynEvent {
+        // KEEL-31 / KEEL-19: refused at construction — nothing connected or grown.
+        if let Some(message) = &self.inner.refused {
+            return DynEvent::Error { message: message.clone() };
+        }
         if let Err(message) = check_name(&name) {
             return DynEvent::Error { message };
         }
