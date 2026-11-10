@@ -358,7 +358,18 @@ for the name it asks for:
 | a revoked name (`dyn revoke`) | refused until admitted again |
 | a name another key, or another kind of peer, holds; a key another peer holds | refused before its schema is asked |
 | an anonymous socket, or one signed in any other way (a session cookie) | no hook at all: its offer is an unknown method, it learns nothing |
-| more than 16 pending, 4 from one address, a second of one key (the older is superseded), 10 minutes waiting | refused (`pending_full`, `superseded`, `pending_expired`; `DynOptions::dial_in_pending_*`) |
+| more than 10 offers going pending from one address a minute, or 3 by one key (each re-offer is a fresh code) | refused `rate_limited` (`dial_in_offers_per_minute_per_*`) |
+| a second offer of one key | the older is superseded |
+| an address past its share (4 waiting) | that address's own oldest is superseded, nobody else's |
+| the list full (16) | the address holding the most gives its oldest, when it holds more than the newcomer's would; spread one an address, `pending_full` |
+| 10 minutes waiting | `pending_expired` |
+
+An address is an IPv4 address, or an IPv6 /64 (one site's), as the
+transport saw it. **Behind a reverse proxy every offer has the proxy's
+address**: the per-address limits then see one address, and its share is
+everyone's — a known limit; dyn reads no forwarded header (there is no
+trusted-proxy setting here). Admitted keys are never held to any of this:
+an admitted node is mounted, not pended.
 
 Admissions and refused keys are kept in `consent.json` with the consents.
 `dyn revoke` closes its socket and refuses it until admitted again;
@@ -397,7 +408,16 @@ and both nonces of the connection (SHA-256 in the domain
 it sees the host's, so nobody in the middle can choose keys to make two
 codes agree. The node prints it; `dyn pending` shows it; *does your
 terminal show EV76-M6TS?* — `dyn admit --code EV76-M6TS` admits the offer
-whose code it is (any case, dashes and spaces optional).
+whose code it is (any case, dashes and spaces optional). **Never admit a
+code the node did not show you.** While an offer waits with a code,
+`dyn admit --name --key` is refused for its name or its key: such an offer
+is admitted by its code only. A node refuses first contact with a host that
+gives it no code to show (`no_pairing_code`: a relay stripping the host's
+nonce is refused, not asked about); a host it already trusts or pins is
+reached without one. The known-hosts file keys a host by its canonical URL
+(scheme and host in lower case, no trailing dot, no default port, no
+trailing `/`; the path kept), so a respelled URL is the pinned host, and
+holds a lock while a pin is written.
 
 What it protects against: a man in the middle at first contact who answers
 each side with a key of its own — the two codes differ, and an operator who

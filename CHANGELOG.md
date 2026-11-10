@@ -21,6 +21,15 @@ first contact on the node's side (known hosts, the pairing code) is
 plexus-core's. Needs plexus-core with NEST-25's dial-in seams (0.11.3).
 `examples/dial_shop.rs`: a shop dialing in. README "A node that dials in".
 
+Review round 1: offers going pending are rate limited by address (an IPv4
+address, an IPv6 /64) and by key (`DynOptions::dial_in_offers_per_minute_
+per_address` 10, `…_per_key` 3); an address past its share supersedes its
+own oldest, and a full list takes the oldest of its busiest address. `dyn
+admit --name --key` is refused while an offer under that name or key waits
+with a pairing code. A mount re-checks admission, refusal and revocation
+under the store's lock as it enters the table (a refusal racing it wins).
+`DialIn::names`. Needs plexus-core's `Admission::mounted -> Result`.
+
 ## [0.3.0] — unreleased
 
 DYNAUTH-31 (breaking only in that `PeerKind` gains a variant): **an
