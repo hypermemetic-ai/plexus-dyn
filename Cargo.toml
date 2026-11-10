@@ -25,7 +25,7 @@ plexus-client = "0.11.0"
 # What #[plexus_macros::activation] expands to names these crates.
 async-trait = "0.1"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
-plexus-auth-core = "0.3.1"
+plexus-auth-core = "0.3.2"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
 futures = "0.3"
