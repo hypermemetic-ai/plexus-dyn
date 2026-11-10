@@ -24,6 +24,14 @@
 //! token minted, never an exchange's presenter or audience — and revoked,
 //! disconnected and consented to (`callers`) as every peer is.
 //!
+//! **A node that dials in** (NEST-25, [`DynActivation::dial_in`]): a
+//! service with no listening port opens a socket to this one, proves its key
+//! and offers an activation; once its key is admitted for its name
+//! (`dyn.admit`, ahead of time or by the pairing code of a pending offer) it
+//! is `dyn.peer.<name>` (`kind: dial_in`) while its socket lives, its
+//! consent its key's. `dyn.pending` lists the offers waiting; `dyn.refuse`
+//! turns a key away for good.
+//!
 //! **Registration and consent** (DYNAUTH-5, [`consent`]): a peer's key
 //! (proved at `_info`) and its declared `needs` are registered at connect
 //! and grow, the key pinned. Its needs are a request: an admin answers with
@@ -120,6 +128,8 @@
 pub mod contain;
 // DYNAUTH-31: a peer served in this process.
 mod in_process;
+// NEST-25: a node that dials in.
+mod dial_in;
 // DYNAUTH-5: a peer's registration and an admin's consent.
 pub mod consent;
 // NEST-21: dyn's settings, on the service's configuration.
@@ -139,6 +149,7 @@ use schemars::JsonSchema;
 
 pub use consent::{Consent, ConsentInfo, ConsentRoles};
 pub use contain::Containment;
+pub use dial_in::{DialIn, PendingInfo};
 use serde::{Deserialize, Serialize};
 
 /// How `dyn` runs.
@@ -179,6 +190,14 @@ pub struct DynOptions {
     /// DYNAUTH-7: where each mint and exchange is recorded, beside the
     /// `plexus::audit` tracing event (PRIVACY-1's sink, when there is one).
     pub audit: Option<Audit>,
+    /// NEST-25: at most this many dial-in offers wait for an operator at
+    /// once (16); past it a new one is refused `pending_full`.
+    pub dial_in_pending_max: usize,
+    /// NEST-25: at most this many wait from one address (4).
+    pub dial_in_pending_per_address: usize,
+    /// NEST-25: an offer waits this long for an operator, then is refused
+    /// `pending_expired` (10 minutes).
+    pub dial_in_pending_age: Duration,
     /// NEST-21: the configuration `dyn` reads its settings from
     /// (`transport.insecure_ws`, `transport.tls_roots`, `child.*`,
     /// `dyn.*`). `None`: the service's own ([`DynamicHub::config`]), taken
@@ -237,6 +256,9 @@ impl Default for DynOptions {
             key_file: None,
             audit: None,
             config: None,
+            dial_in_pending_max: 16,
+            dial_in_pending_per_address: 4,
+            dial_in_pending_age: Duration::from_secs(600),
         }
     }
 }
@@ -253,6 +275,15 @@ pub enum PeerKind {
     /// DYNAUTH-31: an activation of this service, served in its process
     /// ([`DynActivation::attach`]); `by` names who attached it.
     InProcess { by: String },
+    /// NEST-25: a node that dialed in ([`DynActivation::dial_in`]) and is
+    /// held while its socket lives: the key it proved (`principal`), since
+    /// when (unix seconds), and the address it came from.
+    DialIn {
+        principal: String,
+        since: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+    },
 }
 
 /// One peer, as `dyn.peers` lists it.
@@ -448,6 +479,11 @@ pub enum DynEvent {
     Consented { peer: String, needs: Vec<String>, callers: Vec<String> },
     /// DYNAUTH-7: `peer` is revoked.
     Revoked { peer: String, why: String },
+    /// NEST-25: `key` may dial in as `name`; `released`: an offer of it that
+    /// waited is being mounted now.
+    Admitted { name: String, key: String, released: bool },
+    /// NEST-25: `key` is refused (its admissions `names` gone) until admitted.
+    KeyRefused { key: String, names: Vec<String>, why: String },
     /// DYNAUTH-7: the signing key rotated: `kid` signs from now, `previous`
     /// verifies for one more token lifetime.
     Rotated { kid: String, previous: String },
@@ -474,6 +510,8 @@ struct Entry {
     pin: Option<PeerIdentity>,
     /// NEST-21: the identity a remount presented and was refused for.
     presented: Option<PeerIdentity>,
+    /// NEST-25: a node that dialed in: the socket that holds it.
+    dial: Option<Arc<plexus_core::plexus::remote_child::PeerSocket>>,
 }
 
 struct Inner {
@@ -503,6 +541,10 @@ struct Inner {
     /// NEST-21: where the settings are read: `DynOptions::config`, or the
     /// service's once started.
     config: Mutex<Config>,
+    /// NEST-25: the dial-in offers waiting for an operator, by socket.
+    pending: Mutex<dial_in::PendingTable>,
+    /// NEST-25: the dial-in door, once opened.
+    door: Mutex<Option<DialIn>>,
 }
 
 impl consent::ConsentSource for Inner {
@@ -597,6 +639,8 @@ impl DynActivation {
                 dial_key,
                 refused,
                 config: Mutex::new(config.clone()),
+                pending: Mutex::default(),
+                door: Mutex::default(),
             }),
         };
         let this = if load { this.loaded() } else { this };
@@ -696,9 +740,9 @@ impl DynActivation {
     /// grows it again with `replace`. A token already in its hand lives out
     /// its `exp` (≤ 60 s) at a peer that verifies without asking.
     pub fn revoke_peer(&self, peer: &str, why: &str) -> Result<(), String> {
-        let (child, local) = match self.inner.peers.lock().unwrap().get(peer) {
+        let (child, local, dial) = match self.inner.peers.lock().unwrap().get(peer) {
             None => return Err(format!("no peer `{peer}`")),
-            Some(e) => (e.child.clone(), e.local.clone()),
+            Some(e) => (e.child.clone(), e.local.clone(), e.dial.clone()),
         };
         {
             let mut store = self.inner.store.lock().unwrap();
@@ -713,6 +757,10 @@ impl DynActivation {
         // DYNAUTH-31: every call open into an in-process peer ends.
         if let Some(l) = &local {
             l.stop(why);
+        }
+        // NEST-25: a dialed-in node's socket is closed; its next offer is refused.
+        if let Some(s) = &dial {
+            s.close(&format!("revoked: {why}"));
         }
         self.moved();
         tracing::warn!(target: "plexus::audit", peer = %peer, %why, "dyn revoke");
@@ -993,7 +1041,7 @@ impl DynActivation {
                     tracing::warn!(target: "plexus::dyn", peer = %name, "--peers names a peer held in process: not connected");
                     continue;
                 }
-                peers.insert(name, Entry { kind, child: None, local: None, why: Some("not connected yet".into()), remounts: 0, expecting: None, pin: None, presented: None });
+                peers.insert(name, Entry { kind, child: None, local: None, why: Some("not connected yet".into()), remounts: 0, expecting: None, pin: None, presented: None, dial: None });
             }
             let names: Vec<String> = self.inner.peers.lock().unwrap().keys().cloned().collect();
             for name in names {
@@ -1029,7 +1077,8 @@ impl DynActivation {
 
     async fn look_at(&self, name: String) {
         {
-            let child = self.inner.peers.lock().unwrap().get(&name).filter(|e| e.local.is_none()).map(|e| e.child.clone());
+            // NEST-25: a dialed-in node is never redialed: its socket's close takes it out.
+            let child = self.inner.peers.lock().unwrap().get(&name).filter(|e| e.local.is_none() && e.dial.is_none()).map(|e| e.child.clone());
             match child {
                 Some(Some(c)) if c.is_up() => {}
                 Some(Some(c)) => {
@@ -1127,7 +1176,8 @@ impl DynActivation {
                 // (`--via-host`), before its needs are known — and no other.
                 o.schemas = via.iter().map(|t| format!("dyn.peer.{t}")).collect();
             }
-            PeerKind::InProcess { .. } => {}
+            // NEST-25: the transport pings its socket; a call times out as any mount's.
+            PeerKind::InProcess { .. } | PeerKind::DialIn { .. } => {}
         }
         o
     }
@@ -1149,6 +1199,7 @@ impl DynActivation {
                 Ok(ChildSpec::Stdio { name: name.into(), argv })
             }
             PeerKind::InProcess { .. } => Err(format!("`{name}` is served in this process: it is not mounted")),
+            PeerKind::DialIn { .. } => Err(format!("`{name}` dialed in: it comes back by dialing again, never dialed")),
         }
     }
 
@@ -1164,6 +1215,9 @@ impl DynActivation {
                 }
                 if e.local.is_some() {
                     return Err(format!("`{name}` is served in this process: it is not mounted"));
+                }
+                if e.dial.is_some() {
+                    return Err(format!("`{name}` dialed in and is gone: it comes back by dialing again"));
                 }
                 (e.kind.clone(), e.expecting.clone())
             }
@@ -1320,10 +1374,16 @@ impl DynActivation {
                     if let Some(refused) = refuse(&peers) {
                         return refused;
                     }
-                    let old = peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), local: None, why: None, remounts: 0, expecting, pin, presented: None });
-                    // DYNAUTH-31: an in-process peer it replaces is stopped.
-                    if let Some(l) = old.and_then(|e| e.local) {
-                        l.stop("replaced");
+                    let old = peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), local: None, why: None, remounts: 0, expecting, pin, presented: None, dial: None });
+                    // DYNAUTH-31: an in-process peer it replaces is stopped;
+                    // NEST-25: a dialed-in one's socket closed.
+                    if let Some(e) = old {
+                        if let Some(l) = e.local {
+                            l.stop("replaced");
+                        }
+                        if let Some(s) = e.dial {
+                            s.close("replaced");
+                        }
                     }
                 }
                 // DYNAUTH-5: registered — its key and needs — and held to
@@ -1456,6 +1516,9 @@ impl DynActivation {
         let child = match self.inner.peers.lock().unwrap().get(name) {
             None => return Err(PeerError::NotFound { name: name.into() }),
             Some(e) if e.local.is_some() => return Err(PeerError::Unavailable { reason: format!("`{name}` is served in this process: it is not mounted") }),
+            Some(e) if e.dial.is_some() => {
+                return e.child.clone().filter(|c| c.dead().is_none()).ok_or_else(|| PeerError::Unavailable { reason: format!("`{name}` dialed in and is gone") });
+            }
             Some(e) => e.child.clone(),
         };
         match child {
@@ -1550,7 +1613,7 @@ pub fn read_peers_file(file: &Path) -> Result<Vec<(String, PeerKind)>, String> {
 /// and its reads of every peer, consent and pin — each marked `everywhere`,
 /// which [`DynActivation::start`] checks.
 pub const EVERYWHERE: &[&str] =
-    &["connect", "grow", "disconnect", "consent", "consents", "revoke", "rotate_key", "pins", "repin", "peers", "names"];
+    &["connect", "grow", "disconnect", "consent", "consents", "revoke", "rotate_key", "pins", "repin", "peers", "names", "admit", "refuse", "pending"];
 
 /// Runtime peers: connect services, grow dendrites, call them as
 /// `dyn.peer.<name>.<path>.<method>`.
@@ -1603,6 +1666,10 @@ impl DynActivation {
                 if let Some(l) = &e.local {
                     l.stop("disconnected");
                 }
+                // NEST-25: a dialed-in node's socket is dropped.
+                if let Some(s) = &e.dial {
+                    s.close("disconnected");
+                }
                 self.unsurface(&name);
                 DynEvent::Disconnected { name }
             }
@@ -1641,6 +1708,30 @@ impl DynActivation {
             Ok(()) => DynEvent::Revoked { peer, why },
             Err(message) => DynEvent::Error { message },
         }
+    }
+
+    /// NEST-25: let a node dial in — `code`: the pending offer whose pairing
+    /// code it is (the node prints the same one; compare them), its key for
+    /// its name; or `key` for `name`, ahead of time. Lifts a refusal of the
+    /// key and a revocation of the name.
+    #[plexus_macros::method(everywhere)]
+    pub async fn admit(&self, name: Option<String>, key: Option<String>, code: Option<String>) -> DynEvent {
+        self.admit_key(name.as_deref(), key.as_deref(), code.as_deref())
+    }
+
+    /// NEST-25: turn a key away — by `code` (a pending offer's), `key`, or
+    /// `name` (the key admitted for it): refused at once from now, its
+    /// admissions gone, its pending offers refused, its connections closed.
+    #[plexus_macros::method(everywhere)]
+    pub async fn refuse(&self, name: Option<String>, key: Option<String>, code: Option<String>, why: Option<String>) -> DynEvent {
+        self.refuse_key(name.as_deref(), key.as_deref(), code.as_deref(), why.as_deref().unwrap_or("refused by an operator"))
+    }
+
+    /// NEST-25: the dial-in offers waiting for an operator: each one's name,
+    /// key, fingerprint, pairing code, since when and from where.
+    #[plexus_macros::method(everywhere)]
+    pub async fn pending(&self) -> impl Stream<Item = PendingInfo> + Send + 'static {
+        futures::stream::iter(self.pending_list())
     }
 
     /// DYNAUTH-7: rotate the signing key: a new one signs from now, the old
