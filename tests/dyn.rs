@@ -1273,6 +1273,86 @@ async fn a_keyed_peer_calls_back_with_its_proof() {
     relay.abort();
 }
 
+// ------------------------------------------------------------------ KEEL-51
+
+/// `p`'s session, capped by `ceiling` (an agent's minted `role@SCOPE`).
+fn capped(p: &str, ceiling: &[&str]) -> AuthContext {
+    AuthContext::for_principal(&p.parse().unwrap(), "capped", vec![], json!({ plexus_auth_core::grants::CEILING_KEY: ceiling }))
+}
+
+async fn call_as(r: &Rig, auth: &AuthContext, method: &str, params: Value) -> Vec<Value> {
+    items(r.host.route(method, params, Some(auth)).await).await
+}
+
+/// KEEL-51 (NEST-25 review, R2-3): an admin capped to `viewer@*` is refused
+/// `v`'s forecast itself; through a dialed peer whose need is consented and
+/// whose callers are the viewers, the call back to it is decided under the
+/// same ceiling, and refused — the peer's consent layer is one more bound,
+/// never the only one. Uncapped, the admin reaches it through the peer.
+async fn keel51_a_capped_session_is_refused_through_a_dialed_peers_call_back() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let r = rig().await;
+    let (vk, rk) = (PeerKey::generate(), PeerKey::generate());
+    let (vp, rp) = (free_port(), free_port());
+    let v = keyed_peer(vp, verifying(&vk, &r.dyn_.jwk_set(), &r)).await;
+    let relay = served_peer(rp, RelayActivation, verifying(&rk, &r.dyn_.jwk_set(), &r)).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{vp}") })).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "relay", "url": format!("ws://127.0.0.1:{rp}") })).await;
+    let ok = call(&r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.v.forecast"], "callers": ["viewer"] })).await;
+    assert_eq!(ok[0]["type"], "consented", "{ok:?}");
+    let as_viewer = capped(ADMIN, &["viewer@*"]);
+    let direct = call_as(&r, &as_viewer, "dyn.peer.v.forecast", json!({ "city": "oslo" })).await;
+    assert!(direct[0]["route_error"].is_string(), "the ceiling refuses it straight: {direct:?}");
+    let through = call_as(&r, &as_viewer, "dyn.peer.relay.rain", json!({ "city": "oslo" })).await;
+    assert!(through[0]["refused"].as_str().is_some_and(|m| m.contains("dyn.peer.v.forecast") || m.contains("dyn.{peer}")), "and through the peer's call back: {through:?}");
+    // Uncapped, the same admin reaches it through the peer; so does one
+    // capped to a ceiling that allows it.
+    assert_eq!(call(&r, ADMIN, "dyn.peer.relay.rain", json!({ "city": "oslo" })).await[0], json!({ "items": 7 }));
+    let wide = call_as(&r, &capped(ADMIN, &["admin@*"]), "dyn.peer.relay.rain", json!({ "city": "oslo" })).await;
+    assert_eq!(wide[0], json!({ "items": 7 }), "{wide:?}");
+    v.abort();
+    relay.abort();
+}
+
+/// An in-process peer that keeps the context each call was handed.
+struct Keeper {
+    seen: Arc<Mutex<Vec<AuthContext>>>,
+}
+
+#[async_trait::async_trait]
+impl plexus_core::plexus::peer::Peer for Keeper {
+    fn interface(&self) -> plexus_core::plexus::peer::Interface {
+        plexus_core::plexus::peer::Peer::interface(&ProbeActivation)
+    }
+    async fn call(&self, method: &str, params: Value, auth: Option<&AuthContext>) -> Result<PlexusStream, plexus_core::plexus::PlexusError> {
+        self.seen.lock().unwrap().extend(auth.cloned());
+        plexus_core::plexus::peer::Peer::call(&ProbeActivation, method, params, auth).await
+    }
+    async fn peer(&self, name: &str) -> Result<Box<dyn plexus_core::plexus::peer::Peer>, plexus_core::plexus::peer::PeerError> {
+        plexus_core::plexus::peer::Peer::peer(&ProbeActivation, name).await
+    }
+}
+
+/// KEEL-51: an in-process peer is handed the caller's context with its
+/// ceiling — so what it does with it on the service (its own call, as the
+/// caller) is refused past that ceiling, as the caller's own call is.
+async fn keel51_an_in_process_peer_is_handed_the_sessions_ceiling() {
+    let r = rig().await;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    r.dyn_.attach("p", "test", "b1", Arc::new(Keeper { seen: seen.clone() }), false);
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "p", "callers": ["viewer"] })).await;
+    let as_viewer = capped(ADMIN, &["viewer@*"]);
+    assert_eq!(call_as(&r, &as_viewer, "dyn.peer.p.ask", json!({})).await, [json!("asked")]);
+    let handed = seen.lock().unwrap().pop().expect("called with a context");
+    assert_eq!(handed.principal().map(|p| p.to_string()).as_deref(), Some(ADMIN));
+    assert_eq!(handed.metadata.get(plexus_auth_core::grants::CEILING_KEY), Some(&json!(["viewer@*"])), "{:?}", handed.metadata);
+    // What it calls on the service as that context is the capped session's.
+    let theirs = items(r.host.route("dyn.disconnect", json!({ "name": "nothing" }), Some(&handed)).await).await;
+    let mine = call_as(&r, &as_viewer, "dyn.disconnect", json!({ "name": "nothing" })).await;
+    assert!(mine[0]["route_error"].as_str().is_some_and(|e| e.contains("dyn.disconnect")), "{mine:?}");
+    assert_eq!(theirs, mine, "the peer's call as its caller is refused as the caller's own is");
+}
+
 /// A WebSocket peer that answers its mount, then never reads again.
 async fn silent_peer(port: u16) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
@@ -2222,6 +2302,8 @@ fn main() {
             a_peer_whose_key_changed_is_refused_at_remount,
             a_verifying_peer_takes_a_call_by_its_token,
             a_keyed_peer_calls_back_with_its_proof,
+            keel51_a_capped_session_is_refused_through_a_dialed_peers_call_back,
+            keel51_an_in_process_peer_is_handed_the_sessions_ceiling,
             an_onward_call_is_an_exchange,
             keel19_an_unconsented_peer_is_refused_an_exchange,
             keel19_a_consented_peer_reaches_another_with_its_proof,

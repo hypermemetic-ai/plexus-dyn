@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+KEEL-51: tests only (the fix is plexus-core's, its next release after
+0.11.2). `keel51_a_capped_session_is_refused_through_a_dialed_peers_call_back`
+— an admin capped to `viewer@*`, refused `dyn.peer.v.forecast` itself, is
+refused it too through a dialed peer whose need is consented and whose
+callers are the viewers; `keel51_an_in_process_peer_is_handed_the_sessions_ceiling`
+— an in-process peer is handed the caller's ceiling, so its own call as that
+caller is refused as the caller's is. Both red against plexus-core 0.11.2.
+
 ## [0.3.0] — unreleased
 
 DYNAUTH-31 (breaking only in that `PeerKind` gains a variant): **an
