@@ -882,6 +882,15 @@ impl DynActivation {
         }
     }
 
+    /// DYNAUTH-31 (review 2): the gate of the service `dyn` was started in,
+    /// as it stands — for an activation beside it that must ask a grant other
+    /// than its call's (plexus-bridge: whether a caller holds an operator's
+    /// grant on `*`). `None` before `start`, or on a service with no gate.
+    pub fn gate(&self) -> Option<Arc<plexus_auth_core::grants::Gate>> {
+        let service = self.inner.host.lock().unwrap().as_ref().and_then(WeakService::upgrade)?;
+        service.gate().cloned()
+    }
+
     /// The gate's grants generation moves (consent changed what a role holds).
     fn moved(&self) {
         let service = self.inner.host.lock().unwrap().as_ref().and_then(WeakService::upgrade);
