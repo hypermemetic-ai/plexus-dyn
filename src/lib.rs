@@ -1063,7 +1063,12 @@ impl DynActivation {
         }
         match kind {
             PeerKind::Ws { .. } => o.ping = o.ping.or(Some(self.inner.opts.liveness)),
-            PeerKind::Dendrite { .. } => o.timeout = o.timeout.max(self.inner.opts.dendrite_timeout),
+            PeerKind::Dendrite { via, .. } => {
+                o.timeout = o.timeout.max(self.inner.opts.dendrite_timeout);
+                // KEEL-32: the schemas it grows its clients from at its start
+                // (`--via-host`), before its needs are known — and no other.
+                o.schemas = via.iter().map(|t| format!("dyn.peer.{t}")).collect();
+            }
         }
         o
     }
