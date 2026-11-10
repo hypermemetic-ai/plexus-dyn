@@ -170,14 +170,18 @@ What the code checks, in order — the text a change to `remote_child` or
 **Before a peer runs a hop** (`{ns}.call` for method M; a schema call needs
 none of this):
 
-1. A child with a key, or verifying tokens addressed to a key, starts only
-   on a connection proven as a key (`key:<hex>`) — `serve_child_ws` verifies
-   the upgrade's `plexus-key.` proof (`KeyedUpgrade`) — never on a `Pipe`
-   or on a principal no transport proves (`service:dyn`).
-2. Without a verifier, the hop is believed only from a sender `ChildPeer`
-   takes: a pipe; or a connection whose proven principal is trusted to act
-   for others and named as the hop's `principal`.
-3. With one, the hop's token must verify: an EdDSA JWS signed by a trusted
+1. A child with a key, or verifying tokens addressed to a key, is served
+   only by `serve_child_proven`, which takes a `Proven` — a type with no
+   constructor from a string, made only by `KeyedUpgrade::verify` checking
+   the upgrade's `plexus-key.` proof (`serve_child_ws` does it) — and is
+   believed from that principal alone. `serve_child_with` refuses one,
+   whatever `ChildPeer` it is given.
+2. A keyless, non-verifying child (`serve_child_with`) believes any sender
+   its `ChildPeer` takes: on a `Pipe` that is everyone who can write its
+   input — such a child must never be exposed on a network listener; on
+   `ChildPeer::connection` it is the string it was given, which proves
+   nothing by itself.
+3. With a verifier, the hop's token must verify: an EdDSA JWS signed by a trusted
    JWKS key (`iss` = `kid`), `aud` this child, within its times, naming
    `hop.call` and M, its `sub` the hop's caller, its scope holding the
    hop's grant on every scope the hop says.
@@ -205,12 +209,23 @@ none of this):
    holds, mounted or pinned (`identity_changed`, `key_in_use:`), checked
    where the entry is reserved.
 4. Tokens are minted for that key only while it is mounted and not
-   revoked, by a service whose principal is a key; each forwarded hop
+   revoked — asked at the top of each forward and again, after the dial
+   it may await, where the token is minted and where its call back is
+   opened — by a service whose principal is a key; each forwarded hop
    carries the service's proof (`TokenIssuer::prove_forward`).
 5. An exchange (`dyn.exchange`) is decided as a call back is: the presenter
    mounted, not revoked, holding a consented need for the audience and the
    method, within the consent of now; once per (`jti`, audience, method);
    the token bound to the presenter's key.
+
+Replay: an upgrade's key proof is taken once while its 60 s window lasts
+(`KeyedUpgrade` remembers at most 4096; past that the oldest goes), and a
+token's `jti` once while it lives — in memory: a restarted child forgets,
+so a proof or token captured in the last 60 s can be replayed to it once
+after a restart. Key files and the data directory are the user's own, 0600
+and 0700, never read through a symbolic link. A child dial's key proof is
+spec/00's one form, the same bytes as a sign-in to a service at that URL
+(a context of its own is a plexus-wire change, not made).
 
 ## Onward calls (DYNAUTH-6)
 

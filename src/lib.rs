@@ -192,10 +192,30 @@ impl std::fmt::Debug for Audit {
     }
 }
 
+/// KEEL-19 (P5, KEEL-25): the user's own data directory —
+/// `$XDG_DATA_HOME/plexus-dyn`, else `~/.local/share/plexus-dyn`; with
+/// neither, `<tmp>/plexus-dyn-<uid>`. Made 0700; refused at start when it is
+/// not the user's or is open to others (`DynActivation::start`).
+fn default_data_dir() -> PathBuf {
+    let from = |k: &str| std::env::var_os(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    if let Some(x) = from("XDG_DATA_HOME") {
+        return x.join("plexus-dyn");
+    }
+    if let Some(h) = from("HOME") {
+        return h.join(".local/share/plexus-dyn");
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    #[cfg(unix)]
+    let me = format!("plexus-dyn-{}", unsafe { libc::geteuid() });
+    #[cfg(not(unix))]
+    let me = "plexus-dyn".to_string();
+    std::env::temp_dir().join(me)
+}
+
 impl Default for DynOptions {
     fn default() -> Self {
         Self {
-            data_dir: std::env::temp_dir().join("plexus-dyn"),
+            data_dir: default_data_dir(),
             dendrite: PathBuf::from("plexus-dendrite"),
             child: ChildOptions::for_service("dyn"),
             dendrite_timeout: Duration::from_secs(60),
@@ -464,6 +484,8 @@ struct Inner {
     /// acting for others, and rotating either changes only its own role.
     /// `None` when it could not be read or made: then no keyed peer mounts.
     dial_key: Option<PathBuf>,
+    /// KEEL-19 (P5): why the data directory is refused, if it is.
+    refused: Option<String>,
     /// NEST-21: where the settings are read: `DynOptions::config`, or the
     /// service's once started.
     config: Mutex<Config>,
@@ -480,6 +502,10 @@ impl consent::ConsentSource for Inner {
                 continue;
             }
             let Some(child) = peers.get(name).and_then(|e| e.child.as_ref()) else { continue };
+            // KEEL-19: a consent given for another key is another client's.
+            if c.key.as_deref() != child.peer_key() {
+                continue;
+            }
             for m in consent::method_paths(child) {
                 out.push(format!("dyn.peer.{name}.{m}"));
                 if top.contains(name) {
@@ -515,13 +541,25 @@ impl DynActivation {
     /// `dyn` with `opts`.
     pub fn new(opts: DynOptions) -> Self {
         let config = opts.config.clone().unwrap_or_default();
-        let mut issuer = TokenIssuer::new(Self::signing_key(&opts));
+        // KEEL-19 (P5, KEEL-25): the data directory is the user's own and
+        // closed to others, or nothing is read from or kept in it — and
+        // `start` refuses, naming it.
+        let refused = plexus_core::plexus::peer_token::ensure_private_dir(&opts.data_dir).err().map(|why| format!("the data directory: {why}"));
+        if let Some(why) = &refused {
+            tracing::error!(target: "plexus::dyn", "{why}; no key or consent is read from it, and `start` refuses");
+        }
+        let signing = match &refused {
+            None => Self::signing_key(&opts),
+            Some(_) => PeerKey::generate(),
+        };
+        let mut issuer = TokenIssuer::new(signing);
         if let Some(Audit(sink)) = &opts.audit {
             issuer = issuer.with_audit(Arc::clone(sink));
         }
         let issuer = Arc::new(issuer);
-        let dial_key = Self::dial_key(&opts);
-        Self {
+        let dial_key = if refused.is_none() { Self::dial_key(&opts) } else { None };
+        let load = refused.is_none();
+        let this = Self {
             inner: Arc::new(Inner {
                 opts,
                 peers: Mutex::default(),
@@ -533,11 +571,12 @@ impl DynActivation {
                 issuer,
                 proofs: Default::default(),
                 dial_key,
+                refused,
                 config: Mutex::new(config.clone()),
             }),
-        }
-        .loaded()
-        .adopted(config)
+        };
+        let this = if load { this.loaded() } else { this };
+        this.adopted(config)
     }
 
     /// NEST-21: the configuration read now.
@@ -656,6 +695,9 @@ impl DynActivation {
     /// `dyn.jwks` for one token lifetime and the skew. The key file is
     /// replaced. Answers the new key's id and the old one's.
     pub fn rotate_signing_key(&self) -> Result<(String, String), String> {
+        if let Some(why) = &self.inner.refused {
+            return Err(why.clone());
+        }
         let old = self.inner.issuer.kid();
         let new = PeerKey::generate();
         new.save(&Self::key_path(&self.inner.opts))?;
@@ -757,6 +799,9 @@ impl DynActivation {
     }
 
     fn save_store(&self) -> Result<(), String> {
+        if let Some(why) = &self.inner.refused {
+            return Err(why.clone());
+        }
         let s = self.inner.store.lock().unwrap().clone();
         s.save(&self.store_path())
     }
@@ -783,7 +828,9 @@ impl DynActivation {
         }
         let declared = Self::declared(child);
         let store = self.inner.store.lock().unwrap();
-        child.set_consent(Some(consent::consented(store.consents.get(name), declared.as_deref())));
+        // KEEL-19: a consent given for another key is another client's.
+        let given = store.consents.get(name).filter(|c| c.key.as_deref() == child.peer_key());
+        child.set_consent(Some(consent::consented(given, declared.as_deref())));
     }
 
     /// DYNAUTH-5: a new registration of `name` under `key` — the consent
@@ -868,6 +915,9 @@ impl DynActivation {
     /// connected (one that fails listed down), and the liveness task. Call
     /// once the service is built; safe to call again (it does nothing).
     pub async fn start(&self, service: &DynamicHub) -> Result<(), String> {
+        if let Some(why) = &self.inner.refused {
+            return Err(why.clone());
+        }
         *self.inner.host.lock().unwrap() = Some(service.downgrade());
         if self.inner.started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
@@ -1171,8 +1221,8 @@ impl DynActivation {
                     return DynEvent::Error { message };
                 }
                 // KEEL-19: one key, one mount — refused, typed and audited:
-                // checked first, and again where the entry is reserved, under
-                // one hold of the lock (two connects racing on one key).
+                // checked where the entry is reserved, under one hold of the
+                // lock (two connects racing on one key mount one).
                 let refuse = |peers: &BTreeMap<String, Entry>| {
                     let other = key_held_by(peers, &name, child.peer_key())?;
                     let key = child.peer_key().unwrap_or_default().to_string();
@@ -1180,18 +1230,13 @@ impl DynActivation {
                     let old = peers.get(&other).and_then(|e| e.pin.clone());
                     Some(DynEvent::Refused { reason: Refusal::IdentityChanged, message: key_in_use(&name, &key, &other), old, presented: child.identity().map(PeerIdentity::from) })
                 };
-                let early = refuse(&self.inner.peers.lock().unwrap());
-                if let Some(refused) = early {
-                    return refused;
-                }
                 let schema = plexus_core::plexus::Activation::plugin_schema(&child);
                 let interface = interface_of(&child);
                 let methods = schema.methods.iter().map(|m| m.name.clone()).collect();
                 let pin = child.identity().map(PeerIdentity::from);
-                // DYNAUTH-5: registered — its key and needs — and held to
-                // what is consented for it, before it can be reached.
-                self.register(&name, child.peer_key());
-                self.hold(&name, &child);
+                // Nothing upward until it is held to its consent below
+                // (fail closed while it is reserved).
+                child.set_consent(Some(Vec::new()));
                 {
                     let mut peers = self.inner.peers.lock().unwrap();
                     if let Some(refused) = refuse(&peers) {
@@ -1199,6 +1244,11 @@ impl DynActivation {
                     }
                     peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), why: None, remounts: 0, expecting, pin, presented: None });
                 }
+                // DYNAUTH-5: registered — its key and needs — and held to
+                // what is consented for it; only once it holds its name, so
+                // a connect refused above dropped nobody's consent.
+                self.register(&name, child.peer_key());
+                self.hold(&name, &child);
                 // DYNAUTH-7: an admin connecting or growing it again is a
                 // new registration: a revocation ends here.
                 if self.inner.store.lock().unwrap().revoked.remove(&name).is_some() {

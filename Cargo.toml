@@ -41,6 +41,10 @@ tracing = "0.1"
 # DYNAUTH-9: a grown dendrite runs under a Landlock ruleset (the launcher,
 # `plexus-dyn-contain`). landlock 0.4.7 knows ABI 9 (Linux 7.1: a UNIX
 # socket by path); an older kernel is met best-effort.
+# KEEL-19 (KEEL-25): the default data directory names the effective user.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 

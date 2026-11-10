@@ -44,6 +44,20 @@ The dial key is denied to every dendrite. The tests serve keyed peers with
 plexus-core's `serve_child_ws` (the upgrade's key proof verified), never on
 a name.
 
+Fourth pass: **the data directory is the user's own** (KEEL-25, folded
+in). The default is `$XDG_DATA_HOME/plexus-dyn`, else
+`~/.local/share/plexus-dyn` (with neither, `<tmp>/plexus-dyn-<uid>`), no
+longer `/tmp/plexus-dyn`; it is made 0700, and one that is a link, another
+user's, or open to group or others is refused — `start` answers why,
+naming it, and no key or consent is read from or kept in it.
+`consent.json` and the keys are read only as the user's own, 0600, never
+through a link. A connect refused for a key another peer holds is refused
+before it touches the consent of the name it gave (`register`/`hold` after
+the entry is reserved; a consent kept for another key is no longer read
+for a peer, at `hold` nor by the gate's roles). A refused data directory is
+a behaviour change: an existing one made 0755 by an earlier version (e.g.
+plexus-ui's `<data-dir>/dyn`) is refused until `chmod 700`.
+
 ## [0.2.0] — unreleased
 
 On plexus-core, plexus-macros and plexus-client 0.11 (NEST-24): a new minor,

@@ -84,11 +84,12 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    /// KEEL-19 (P5, KEEL-25): read only when it is the user's own, 0600, and
+    /// not a symbolic link; a missing file is no consent.
     pub(crate) fn load(path: &Path) -> Result<Self, String> {
-        match std::fs::read(path) {
-            Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(format!("{}: {e}", path.display())),
+        match plexus_core::plexus::peer_token::read_private_if_any(path)? {
+            Some(b) => serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display())),
+            None => Ok(Self::default()),
         }
     }
 

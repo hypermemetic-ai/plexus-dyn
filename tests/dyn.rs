@@ -170,7 +170,9 @@ async fn rig_with(peers_file: Option<PathBuf>) -> Rig {
 async fn rig_opts(peers_file: Option<PathBuf>, tweak: impl FnOnce(&mut DynOptions)) -> Rig {
     let data = tempfile::tempdir().unwrap();
     let mut opts = DynOptions {
-        data_dir: data.path().to_path_buf(),
+        // KEEL-19 (KEEL-25): a directory `dyn` makes itself, 0700 (a temp
+        // directory may be 0755, which it refuses).
+        data_dir: data.path().join("dyn"),
         dendrite: dendrite_bin(),
         liveness: Duration::from_millis(300),
         peers_file,
@@ -384,6 +386,15 @@ async fn served_peer<A>(port: u16, activation: A, opts: plexus_core::plexus::rem
 where
     A: plexus_core::plexus::Activation + Clone + Send + Sync + 'static,
 {
+    served_peer_after(port, activation, opts, Duration::ZERO).await
+}
+
+/// [`served_peer`], each upgrade answered only after `delay` (a peer slow to
+/// come back).
+async fn served_peer_after<A>(port: u16, activation: A, opts: plexus_core::plexus::remote_child::ServeChild, delay: Duration) -> tokio::task::JoinHandle<()>
+where
+    A: plexus_core::plexus::Activation + Clone + Send + Sync + 'static,
+{
     let deadline = Instant::now() + Duration::from_secs(5);
     let listener = loop {
         match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
@@ -409,6 +420,7 @@ where
             let Ok((tcp, _)) = listener.accept().await else { break };
             let (activation, upgrade, trusted, key, tokens) = (activation.clone(), Arc::clone(&upgrade), trusted.clone(), opts.key.clone(), opts.tokens.clone());
             conns.spawn(async move {
+                tokio::time::sleep(delay).await;
                 let _ = plexus_core::plexus::remote_child::serve_child_ws(activation, tcp, &upgrade, trusted, key, tokens).await;
             });
         }
@@ -722,14 +734,15 @@ async fn an_onward_call_is_an_exchange() {
 /// on one input proven as `proven`, trusting only `service` to act for
 /// others: the connection a presenter opens to it itself. One `tell.call`
 /// with `hop`; its first item.
-async fn direct_to_t(tk: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core::plexus::peer_token::Jwks, proven: &str, service: &str, hop: Value) -> Value {
-    use plexus_core::plexus::remote_child::{serve_child_with, ChildPeer, ServeChild};
+async fn direct_to_t(tk: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexus_core::plexus::peer_token::Jwks, by: &plexus_core::plexus::peer_token::PeerKey, service: &str, hop: Value) -> Value {
+    use plexus_core::plexus::remote_child::{dial_proof, serve_child_proven, KeyedUpgrade};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let v = plexus_core::plexus::peer_token::Verifier::new(tk.kid(), jwks).unwrap();
-    let opts = ServeChild { peer: ChildPeer::connection(proven, [service.to_string()]), key: Some(tk.clone()), tokens: Some(Arc::new(v)) };
+    // KEEL-19: the connection proven as `by` by verifying `by`'s dial proof.
+    let proven = KeyedUpgrade::new(["ws://t.test"]).verify(&dial_proof(by, "ws://t.test", "presenter")).unwrap();
     let (mut to_t, t_in) = tokio::io::duplex(1 << 16);
     let (t_out, from_t) = tokio::io::duplex(1 << 16);
-    tokio::spawn(serve_child_with(TellActivation, t_in, t_out, opts));
+    tokio::spawn(serve_child_proven(TellActivation, t_in, t_out, proven, vec![service.to_string()], Some(tk.clone()), Some(Arc::new(v))));
     let frame = json!({ "jsonrpc": "2.0", "id": 1, "method": "tell.call", "params": { "method": "tell.claims", "params": {}, "hop": hop } });
     to_t.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
     let mut lines = tokio::io::BufReader::new(from_t).lines();
@@ -838,19 +851,19 @@ async fn keel19_a_consented_peer_reaches_another_with_its_proof() {
         (t, call)
     };
     let (t, c) = exchanged().await;
-    let got = direct_to_t(&p.tk, &jwks, p.rk.kid(), service, hop(&t, &c, Some(prove(&p.rk, &t, "tell.claims", &c)))).await;
+    let got = direct_to_t(&p.tk, &jwks, &p.rk, service, hop(&t, &c, Some(prove(&p.rk, &t, "tell.claims", &c)))).await;
     assert_eq!(got["content"]["claims"]["sub"], USER, "t ran it for the user: {got:?}");
     assert_eq!(got["content"]["claims"]["scope"], "tell.claims@*", "{got:?}");
     // No proof: refused.
     let (t, c) = exchanged().await;
-    let got = direct_to_t(&p.tk, &jwks, p.rk.kid(), service, hop(&t, &c, None)).await;
+    let got = direct_to_t(&p.tk, &jwks, &p.rk, service, hop(&t, &c, None)).await;
     assert!(got["message"].as_str().is_some_and(|m| m.contains("no proof of possession")), "{got:?}");
     // relay's proof, carried over another's connection: refused.
     let other = PeerKey::generate();
     let (t, c) = exchanged().await;
     let mut h = hop(&t, &c, Some(prove(&p.rk, &t, "tell.claims", &c)));
     h["principal"] = json!(other.kid());
-    let got = direct_to_t(&p.tk, &jwks, other.kid(), service, h).await;
+    let got = direct_to_t(&p.tk, &jwks, &other, service, h).await;
     assert!(got["message"].as_str().is_some_and(|m| m.contains("not as the presenter")), "{got:?}");
     p.end();
 }
@@ -986,6 +999,98 @@ async fn keel19_dyn_dials_with_a_key_and_no_peer_trusts_a_name() {
     let named = plexus_core::plexus::remote_child::ServeChild { key: Some(k.clone()), peer: plexus_core::plexus::remote_child::ChildPeer::connection(DYN, [DYN.to_string()]), tokens: None };
     let served = tokio::time::timeout(Duration::from_secs(2), plexus_core::plexus::remote_child::serve_child_with(WeatherActivation, v_in, v_out, named)).await.expect("refused at once");
     assert_eq!(served.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+}
+
+/// KEEL-19 (P4, KEEL-22's first row): a revoke while a call is on its way —
+/// past `forward`'s first check, waiting for the peer to be dialed again —
+/// mints no token and opens no call.
+async fn keel19_a_revoke_while_dialing_mints_nothing() {
+    use plexus_core::plexus::peer_token::{AuditKind, PeerKey};
+    let records = Arc::new(Records::default());
+    let sink = records.clone();
+    let r = rig_opts(None, move |o| o.audit = Some(plexus_dyn::Audit(sink))).await;
+    let k = PeerKey::generate();
+    let port = free_port();
+    let fast = keyed_peer(port, verifying(&k, &r.dyn_.jwk_set(), &r)).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "v", "url": format!("ws://127.0.0.1:{port}") })).await;
+    assert_eq!(call(&r, USER, "dyn.peer.v.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    // It goes, and comes back slowly: the next call waits in the dial.
+    fast.abort();
+    let _ = fast.await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while peer(&r, "v").up {
+        assert!(Instant::now() < deadline, "never seen down");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let slow = served_peer_after(port, WeatherActivation, verifying(&k, &r.dyn_.jwk_set(), &r), Duration::from_millis(1500)).await;
+    records.0.lock().unwrap().clear();
+    let host = Arc::clone(&r.host);
+    let on_its_way = tokio::spawn(async move { items(host.route("dyn.peer.v.forecast", json!({ "city": "oslo" }), Some(&who(USER))).await).await });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let revoked = call(&r, ADMIN, "dyn.revoke", json!({ "peer": "v", "why": "compromised" })).await;
+    assert_eq!(revoked[0]["type"], "revoked", "{revoked:?}");
+    let got = on_its_way.await.unwrap();
+    assert!(got.len() < 7 && got[0]["message"].as_str().is_some_and(|m| m.contains("revoked")), "forwarded after the revoke: {got:?}");
+    let minted: Vec<_> = records.0.lock().unwrap().iter().filter(|m| m.kind == AuditKind::Mint && m.aud == k.kid()).cloned().collect();
+    assert!(minted.is_empty(), "a token minted for a revoked peer: {minted:?}");
+    slow.abort();
+}
+
+/// KEEL-19 (P5, KEEL-25): a data directory open to others is refused at
+/// start, naming it — and nothing is read from or kept in it; one the user
+/// owns, 0700, is taken; the default is the user's own, never `/tmp`'s.
+async fn keel19_a_data_directory_open_to_others_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let default = DynOptions::default().data_dir;
+    assert!(default.ends_with("plexus-dyn") && !default.starts_with(std::env::temp_dir()), "{default:?}");
+    let tmp = tempfile::tempdir().unwrap();
+    let open = tmp.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let d = DynActivation::new(DynOptions { data_dir: open.clone(), ..DynOptions::default() });
+    let service = DynamicHub::new("host");
+    let why = d.start(&service).await.unwrap_err();
+    assert!(why.contains(&open.display().to_string()) && why.contains("open to others"), "{why}");
+    assert!(!open.join("dyn.key").exists() && !open.join("dial.key").exists(), "a key kept in a refused directory");
+    assert_eq!(d.dial_principal(), None);
+    // A private one is made 0700 and taken.
+    let private = tmp.path().join("private");
+    let d = DynActivation::new(DynOptions { data_dir: private.clone(), ..DynOptions::default() });
+    assert_eq!(std::fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o700);
+    assert!(d.dial_principal().is_some());
+    // A dial key planted as a link (to a key the user owns, 0600): refused.
+    let other = tmp.path().join("planted");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let real = tmp.path().join("someone.key");
+    plexus_core::plexus::peer_token::PeerKey::load_or_create(&real).unwrap();
+    std::os::unix::fs::symlink(&real, other.join("dial.key")).unwrap();
+    let d = DynActivation::new(DynOptions { data_dir: other, ..DynOptions::default() });
+    assert_eq!(d.dial_principal(), None, "dialed as a planted key");
+}
+
+/// KEEL-19 (NN2's side effect): a connect refused for a key another holds
+/// drops nobody's consent — not that of the entry it named.
+async fn keel19_a_refused_connect_keeps_the_named_consent() {
+    use plexus_core::plexus::peer_token::PeerKey;
+    let r = rig().await;
+    let (k1, k2) = (PeerKey::generate(), PeerKey::generate());
+    let (px, py, pz) = (free_port(), free_port(), free_port());
+    let x = keyed_peer(px, keyed(&k1, &r)).await;
+    let y = keyed_peer(py, keyed(&k2, &r)).await;
+    let z = keyed_peer(pz, keyed(&k2, &r)).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "x", "url": format!("ws://127.0.0.1:{px}") })).await;
+    call(&r, ADMIN, "dyn.connect", json!({ "name": "y", "url": format!("ws://127.0.0.1:{py}") })).await;
+    call(&r, ADMIN, "dyn.consent", json!({ "peer": "x", "callers": ["viewer"] })).await;
+    let got = call(&r, ADMIN, "dyn.connect", json!({ "name": "x", "url": format!("ws://127.0.0.1:{pz}"), "replace": true })).await;
+    assert!(got[0]["message"].as_str().is_some_and(|m| m.starts_with("key_in_use:")), "{got:?}");
+    let listed = call(&r, VIEWER, "dyn.consents", json!({})).await;
+    let xs = listed.iter().find(|c| c["peer"] == "x").unwrap();
+    assert_eq!((xs["callers"].clone(), xs["key"].clone()), (json!(["viewer"]), json!(k1.kid())), "x's consent went with the refused connect: {listed:?}");
+    assert_eq!(call(&r, VIEWER, "dyn.peer.x.forecast", json!({ "city": "oslo" })).await.len(), 7);
+    for t in [x, y, z] {
+        t.abort();
+    }
 }
 
 // ------------------------------------------------------------------ DYNAUTH-7
@@ -1860,6 +1965,9 @@ fn main() {
             keel19_a_key_is_mounted_once,
             keel19_two_connects_racing_on_one_key,
             keel19_dyn_dials_with_a_key_and_no_peer_trusts_a_name,
+            keel19_a_revoke_while_dialing_mints_nothing,
+            keel19_a_data_directory_open_to_others_is_refused,
+            keel19_a_refused_connect_keeps_the_named_consent,
             a_revoked_peer_is_refused_and_its_tokens_expire,
             every_hop_is_audited_without_a_secret,
             the_signing_key_rotates,
