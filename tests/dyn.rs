@@ -739,7 +739,7 @@ async fn direct_to_t(tk: &plexus_core::plexus::peer_token::PeerKey, jwks: &plexu
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let v = plexus_core::plexus::peer_token::Verifier::new(tk.kid(), jwks).unwrap();
     // KEEL-19: the connection proven as `by` by verifying `by`'s dial proof.
-    let proven = KeyedUpgrade::new(["ws://t.test"]).verify(&dial_proof(by, "ws://t.test", "presenter")).unwrap();
+    let proven = KeyedUpgrade::new(["ws://t.test"]).verify(&dial_proof(by, "ws://t.test")).unwrap();
     let (mut to_t, t_in) = tokio::io::duplex(1 << 16);
     let (t_out, from_t) = tokio::io::duplex(1 << 16);
     tokio::spawn(serve_child_proven(TellActivation, t_in, t_out, proven, vec![service.to_string()], Some(tk.clone()), Some(Arc::new(v))));

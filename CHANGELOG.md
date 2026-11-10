@@ -58,6 +58,20 @@ for a peer, at `hold` nor by the gate's roles). A refused data directory is
 a behaviour change: an existing one made 0755 by an earlier version (e.g.
 plexus-ui's `<data-dir>/dyn`) is refused until `chmod 700`.
 
+Fifth pass: `dyn` dials its peers as the reserved agent
+`plexus.child-dial` (plexus-core 0.11.1's `ws::dial`), which a keyed peer's
+`serve_child_ws` requires, so a peer on 0.11.1 refuses a 0.2.0 `dyn`'s
+dial: upgrade `dyn` and its keyed peers together. A peer's upgrade ledger
+refuses when full (4096 proofs a minute) instead of evicting. The example
+prints the dial principal at start (`dial principal: key:…`), which each
+keyed peer trusts. Requires plexus-auth-core 0.3.2 and plexus-macros 0.11.1.
+
+**Moving from 0.2.0:** upgrade with plexus-core 0.11.1 on both sides; give
+each keyed peer `dial_principal()` to trust and serve it with
+`serve_child_ws`; `chmod 700` a data directory an earlier version made
+group- or world-readable, or move it (the default moved from
+`/tmp/plexus-dyn`, whose keys and consent are not carried over).
+
 ## [0.2.0] — unreleased
 
 On plexus-core, plexus-macros and plexus-client 0.11 (NEST-24): a new minor,
