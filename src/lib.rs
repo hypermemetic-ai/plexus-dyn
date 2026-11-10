@@ -1069,6 +1069,9 @@ impl DynActivation {
         if o.host.is_none() {
             o.host = self.inner.host.lock().unwrap().clone();
         }
+        // KEEL-32 (R3-1): dyn keeps a consent — nothing declared counts until
+        // `hold` applies it, from the handshake on.
+        o.consent_required = true;
         match kind {
             PeerKind::Ws { .. } => o.ping = o.ping.or(Some(self.inner.opts.liveness)),
             PeerKind::Dendrite { via, .. } => {
@@ -1124,7 +1127,10 @@ impl DynActivation {
             }
         };
         // NEST-16: the remount is the same graft: checked again.
-        let mounted = match RemoteChild::connect(spec, self.child_options(&kind)).await {
+        // KEEL-32 (R3-1): a revoked peer is remounted revoked from its first
+        // byte (a fresh connect or grow with `replace` is what lifts it).
+        let revoked = self.inner.store.lock().unwrap().revoked.get(name).cloned();
+        let mounted = match RemoteChild::connect(spec, self.child_options(&kind).with_revoked(revoked)).await {
             Ok(child) => self.vet(name, &child, expecting.as_deref()).map(|_| child),
             Err(e) => Err(e.to_string()),
         };
@@ -1643,5 +1649,21 @@ impl DynActivation {
     #[plexus_macros::peer(list = names)]
     async fn peer(&self, name: &str) -> Result<Box<dyn Peer>, PeerError> {
         self.get(name).await.map(|c| Box::new(c) as Box<dyn Peer>)
+    }
+}
+
+#[cfg(test)]
+mod r3_1 {
+    use super::*;
+
+    /// KEEL-32 (R3-1): every mount dyn makes keeps a consent from its
+    /// handshake on — nothing a peer declares counts until `hold`.
+    #[test]
+    fn every_mount_holds_its_consent_from_the_handshake() {
+        let data = tempfile::tempdir().unwrap();
+        let dyn_ = DynActivation::new(DynOptions { data_dir: data.path().join("dyn"), dendrite: data.path().join("no-dendrite"), ..DynOptions::default() });
+        for kind in [PeerKind::Ws { url: "ws://127.0.0.1:1".into() }, PeerKind::Dendrite { dir: "d".into(), via: vec!["w".into()] }] {
+            assert!(dyn_.child_options(&kind).consent_required, "{kind:?}");
+        }
     }
 }
