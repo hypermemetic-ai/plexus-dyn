@@ -34,6 +34,7 @@ const GARDENER: &str = "key:0202020202020202020202020202020202020202020202020202
 const KILN_OPERATOR: &str = "key:0404040404040404040404040404040404040404040404040404040404040404";
 const KILN_ADMIN: &str = "key:0303030303030303030303030303030303030303030303030303030303030303";
 const VIEWER: &str = "key:0707070707070707070707070707070707070707070707070707070707070707";
+const CLERK: &str = "key:0808080808080808080808080808080808080808080808080808080808080808";
 
 // ------------------------------------------------------------------ the peers
 
@@ -72,6 +73,25 @@ impl TillActivation {
     #[plexus_macros::method]
     pub async fn count(&self) -> Value {
         json!(3)
+    }
+}
+
+#[derive(Clone)]
+pub struct ClerkActivation {
+    dyn_: DynActivation,
+}
+
+/// A clerk of the host's own, who looks into the shop by hand.
+#[plexus_macros::activation(namespace = "clerk", version = "1.0.0")]
+impl ClerkActivation {
+    /// Acts on the whole clerk: and, inside, calls the shop itself — not a
+    /// call any gate admitted at the shop's door.
+    #[plexus_macros::method(everywhere)]
+    pub async fn peek(&self) -> Value {
+        let auth = plexus_core::call::caller().ok().and_then(|c| c.auth().cloned());
+        let Ok(shop) = self.dyn_.get("shop").await else { return json!({ "refused": "no shop" }) };
+        let opened = plexus_core::plexus::Activation::call(&shop, "stock", json!({}), auth.as_ref(), None).await;
+        items(opened).await.into_iter().next().unwrap_or(Value::Null)
     }
 }
 
@@ -155,7 +175,7 @@ async fn world_minting(tokens: bool) -> World {
     let opts = DynOptions { data_dir: data.path().join("dyn"), dendrite: data.path().join("no-dendrite"), liveness: Duration::from_secs(3600), tokens, ..DynOptions::default() };
     let dyn_ = DynActivation::new(opts);
     let mut lists: Vec<(String, Vec<String>)> = DynamicHub::new("host").register(dyn_.clone()).declared_roles().into_iter().collect();
-    lists.push(("operator".into(), vec!["dyn.connect".into(), "dyn.disconnect".into(), "dyn.{peer}".into()]));
+    lists.push(("operator".into(), vec!["dyn.connect".into(), "dyn.disconnect".into(), "dyn.{peer}".into(), "clerk.peek".into()]));
     let roles = RoleTable::from_lists(lists.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let members = Arc::new(Members::default());
     for (who, role, scope) in [
@@ -166,11 +186,13 @@ async fn world_minting(tokens: bool) -> World {
         (KILN_OPERATOR, "operator", "KILN"),
         (KILN_ADMIN, "admin", "KILN"),
         (VIEWER, "viewer", "KILN"),
+        (CLERK, "operator", "/clerk"),
     ] {
         members.0.lock().unwrap().push(Membership { principal: who.parse().unwrap(), role: plexus_auth_core::RoleName::new(role), scope: ScopeRef::parse(scope) });
     }
     let gate = Arc::new(Gate::new(members, dyn_.consent_roles(Arc::new(roles)), Arc::new(Shortcodes)));
-    let host = Arc::new(DynamicHub::new("host").register(dyn_.clone()).with_gate(gate));
+    let clerk = ClerkActivation { dyn_: dyn_.clone() };
+    let host = Arc::new(DynamicHub::new("host").register(dyn_.clone()).register(clerk).with_gate(gate));
     dyn_.start(&host).await.unwrap();
     let jwks = dyn_.jwk_set();
     let trusted = vec![dyn_.dial_principal().expect("dyn dials with a key")];
@@ -369,4 +391,16 @@ async fn a_consented_viewer_still_calls_the_peer_and_reads_its_schema() {
     let schema = w.call(SHOPKEEPER, "dyn.peer.shop.schema", json!({})).await;
     assert!(schema[0]["methods"].as_array().is_some_and(|m| m.iter().any(|m| m["name"] == "stock")), "{schema:?}");
     assert!(w.call(KILN_OPERATOR, "dyn.peer.shop.schema", json!({})).await[0]["refused"].is_string());
+}
+
+/// A door is one call's: the clerk is admitted at the clerk's door, and a
+/// call its method makes into the shop by hand carries no door across — the
+/// shop, verifying, refuses it (nothing held for it), where a door would
+/// have let it in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_door_does_not_cross_for_a_call_the_gate_did_not_admit_at_it() {
+    let w = world().await;
+    let got = w.call(CLERK, "clerk.peek", json!({})).await;
+    assert!(got[0]["refused"].as_str().is_some_and(|m| m.contains("does not hold")), "{got:?}");
+    assert!(refused(&w.call(CLERK, "dyn.peer.shop.stock", json!({})).await, "dyn.{peer}"));
 }
