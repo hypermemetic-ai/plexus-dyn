@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+ONE-7: tests, and one row flipped (the change is plexus-core 0.11.4's, on
+plexus-auth-core 0.3.4). **dyn's door, and one peer's**: a role held on an
+address — `operator on /dyn` (dyn's own whole-service methods: `connect`,
+`disconnect`, …), `operator on /dyn.peer.shop.*` (the peer `shop` alone),
+`operator on /dyn.*` (dyn and every peer) — opens that door and holds no
+data. KEEL-44 is closed for the slot grant: a role listing `dyn.{peer}` on a
+data scope reaches no peer; consent's `callers` reach the peer's methods
+and schema as before (literal grants). `tests/one7_door.rs`, over keyed,
+token-verifying WebSocket peers: an operator of `/dyn` connects and an
+admin of `KILN` does not; the shopkeeper reaches `shop` (its far side admits
+it at the door: no data held, the token's scope `shop.stock@/shop.stock`)
+and is refused `till` and `dyn.connect`; the shop's call back to `till`
+runs under no more than the call held (the door of `shop` alone), with
+tokens and without; a session capped to one peer's door stays capped
+through the hop and back, one capped to a data scope opens no peer; a
+consented viewer of a data scope still calls the shop and reads its schema.
+An admin of a data scope still reaches a peer's ordinary methods by their
+literal path (admin lists every grant) — said by a row, not closed here.
+
+`dyn.rs` (KEEL-19 N2) **flips**: a consent narrowed to a data scope while a
+call is open (`dyn.peer.t.claims@MENGER`) now refuses the next call back
+into the peer `t`, where it was admitted narrowed to `MENGER` — a peer is
+reached at its door, which no data scope opens.
+
 KEEL-51: tests only (the fix is plexus-core's, its next release after
 0.11.2). `keel51_a_capped_session_is_refused_through_a_dialed_peers_call_back`
 — an admin capped to `viewer@*`, refused `dyn.peer.v.forecast` itself, is
