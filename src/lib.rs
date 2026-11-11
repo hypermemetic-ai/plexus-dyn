@@ -1430,10 +1430,14 @@ impl DynActivation {
                     }
                     let old = peers.insert(name.clone(), Entry { kind, child: Some(child.clone()), local: None, why: None, remounts: 0, expecting, pin, presented: None, dial: None });
                     // DYNAUTH-31: an in-process peer it replaces is stopped;
-                    // NEST-25: a dialed-in one's socket closed.
+                    // NEST-25: a dialed-in one's socket closed; KEEL-59: a
+                    // URL peer's or a dendrite's calls ended.
                     if let Some(e) = old {
                         if let Some(l) = e.local {
                             l.stop("replaced");
+                        }
+                        if let Some(c) = e.child {
+                            c.stop("replaced");
                         }
                         if let Some(s) = e.dial {
                             s.close("replaced");
@@ -1710,7 +1714,9 @@ impl DynActivation {
         self.add(name, PeerKind::Dendrite { dir: dir.display().to_string(), via: targets }, replace.unwrap_or(false), expecting).await
     }
 
-    /// Let go of the peer `name` (a dendrite's process ends with its last call).
+    /// Let go of the peer `name`. KEEL-59: every call open into it ends now,
+    /// each with one item saying why (`disconnected`), and the peer is told
+    /// to stop each (a dendrite's process then ends with its last call).
     #[plexus_macros::method(everywhere)]
     pub async fn disconnect(&self, name: String) -> DynEvent {
         let gone = self.inner.peers.lock().unwrap().remove(&name);
@@ -1719,6 +1725,12 @@ impl DynActivation {
                 // DYNAUTH-31: every call open into an in-process peer ends.
                 if let Some(l) = &e.local {
                     l.stop("disconnected");
+                }
+                // KEEL-59: and every call open into a URL peer or a
+                // dendrite, each with one item saying why, the peer told to
+                // stop each; nothing more is forwarded to it.
+                if let Some(c) = &e.child {
+                    c.stop("disconnected");
                 }
                 // NEST-25: a dialed-in node's socket is dropped.
                 if let Some(s) = &e.dial {
