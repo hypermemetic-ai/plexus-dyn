@@ -900,9 +900,12 @@ async fn keel19_a_revoked_presenter_is_refused_at_once() {
 /// KEEL-19 (N2): a consent narrowed while a forwarded call is open narrows
 /// the next call back made under it — the token minted before (held `*`)
 /// no longer decides alone: the call back is held to what consent allows
-/// now, `MENGER` — its ceiling, and so the token minted onward for `t`,
-/// holds `MENGER` alone (this rig's gate resolves every target everywhere,
-/// so the narrowed call is admitted, and narrowed).
+/// now, `MENGER` — its ceiling.
+///
+/// ONE-7 (KEEL-44): a call into a peer is decided at its door, which no data
+/// scope opens — a ceiling layer on `MENGER` alone included. Narrowed to
+/// `MENGER`, the call back into `t` is refused (it used to be admitted and
+/// handed `held_on [MENGER]`, a data scope that means nothing to `t`).
 async fn keel19_a_narrowed_consent_holds_an_open_call() {
     let p = pair(true).await;
     let r = Arc::clone(&p.r.host);
@@ -914,7 +917,8 @@ async fn keel19_a_narrowed_consent_holds_an_open_call() {
     let c = call(&p.r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims@MENGER"] })).await;
     assert_eq!(c[0]["type"], "consented", "{c:?}");
     let got = open.await.unwrap();
-    assert_eq!(got[0]["claims"]["scope"], "tell.claims@MENGER", "the call back went through on the token's `*`: {got:?}");
+    assert!(got[0]["claims"].is_null(), "the call back went through on the token's `*`: {got:?}");
+    assert!(got[0]["refused"].as_str().is_some_and(|m| m.contains("dyn.{peer}")), "refused at t's door, naming the slot: {got:?}");
     // Consented everywhere again: the next call reaches t.
     call(&p.r, ADMIN, "dyn.consent", json!({ "peer": "relay", "needs": ["dyn.peer.t.claims"] })).await;
     let got = call(&p.r, USER, "dyn.peer.relay.ask", json!({})).await;
