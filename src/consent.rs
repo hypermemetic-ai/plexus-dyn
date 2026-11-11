@@ -186,6 +186,28 @@ pub(crate) fn check(peer: &str, consent: &Consent, declared: Option<&[String]>) 
     Ok(())
 }
 
+/// ONE-7 (review L1): the needs of `needs` that can never be met — a call
+/// into a peer (`into_peer`: `dyn.peer.<name>.<m>`, or `<name>.<m>` for a
+/// peer served at the top level) narrowed to a data scope (`…@MENGER`). A
+/// call into a peer is decided at its door, which a data scope never opens
+/// (KEEL-44): narrowed there, the call back is refused every time. `*` and
+/// an address (`…@/dyn.peer.<name>.*`) can be met.
+pub(crate) fn unmeetable<'a>(needs: &'a [String], into_peer: impl Fn(&str) -> bool) -> Vec<&'a str> {
+    needs
+        .iter()
+        .map(String::as_str)
+        .filter(|n| {
+            let (m, s) = split_need(n);
+            s != "*" && !s.starts_with('/') && into_peer(m)
+        })
+        .collect()
+}
+
+/// A need's method that is a call into a peer through `dyn`'s slot.
+pub(crate) fn through_the_slot(method: &str) -> bool {
+    method.starts_with("dyn.peer.")
+}
+
 /// What a mount holds its child's calls back to: each consented need that
 /// is still declared, on its scopes.
 pub(crate) fn consented(consent: Option<&Consent>, declared: Option<&[String]>) -> Vec<Consented> {
@@ -276,6 +298,19 @@ mod tests {
             Consented { method: "shop.items".into(), scopes: vec!["A".into(), "B".into()] },
         ]);
         assert!(consented(None, Some(&declared)).is_empty(), "no consent: nothing upward");
+    }
+
+    /// ONE-7 (review L1): a need into a peer narrowed to a data scope is
+    /// one no call back can meet; `*`, an address, and a need of the
+    /// service's own (data is its own to name) can be.
+    #[test]
+    fn a_need_into_a_peer_on_a_data_scope_is_never_met() {
+        let top = |m: &str| through_the_slot(m) || m.starts_with("w.");
+        let needs: Vec<String> = ["dyn.peer.t.claims@MENGER", "dyn.peer.t.claims", "dyn.peer.t.claims@*", "dyn.peer.t.claims@/dyn.peer.t.*", "w.forecast@KILN", "shop.items@MENGER"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(unmeetable(&needs, top), vec!["dyn.peer.t.claims@MENGER", "w.forecast@KILN"]);
     }
 
     #[test]

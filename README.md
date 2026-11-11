@@ -20,7 +20,7 @@ dendrites, each served as a peer in one untyped slot:
 | `dyn.admit { name?, key?, code? }` | admin | NEST-25: let a node dial in — `code` the pending offer whose pairing code it is, or `key` for `name` ahead of time; lifts a refusal of the key and a revocation of the name |
 | `dyn.refuse { name?, key?, code?, why? }` | admin | NEST-25: turn a key away for good (until admitted): its admissions, pending offers and connections go |
 | `dyn.pending` | admin | NEST-25: the dial-in offers waiting: name, key, fingerprint, pairing code, since, address |
-| `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}` | a call into a peer; a role may list a literal path (`dyn.peer.digest.rainy`) instead, or be named by its consent's `callers` |
+| `dyn.peer.<name>.<path>.<method>` | `dyn.{peer}`, at the peer's door | a call into a peer: the slot grant held on `*` or an address covering it (`/dyn.peer.<name>.*`, `/dyn.*`); a role may list a literal path (`dyn.peer.digest.rainy`) instead, or be named by its consent's `callers` |
 
 **Grafts** (NEST-16): every connect, grow and remount reads the peer's
 `needs` (what it calls of this service: a graft written with `parent =
@@ -31,6 +31,46 @@ changed. A need below `dyn.{peer}` counts as served when the slot is.
 `connect`, `grow` and `disconnect` are listed in no role: only `admin`
 holds them. `dyn.{peer}` is the untyped slot's grant, also `admin`'s
 unless a role lists it; the peer decides again inside it.
+
+**Doors** (ONE-7, plexus-core 0.11.4 on plexus-auth-core 0.3.4): dyn's
+whole-service methods and the peer slot are decided at the door of the call
+— on `*`, or on an *address* scope covering it — never on a data scope. A
+role held on `/dyn` reaches dyn's own whole-service methods (`connect`,
+`disconnect`, … — what the role lists); on `/dyn.peer.shop.*` the peer
+`shop` alone; on `/dyn.*` dyn and every peer. `dyn.{peer}` held on a data
+scope (`KILN`) reaches no peer. A call into a peer admitted at its door
+carries that door across the hop for that call alone (plexus-wire spec/12
+`limit.door`), and the peer's calls back hold that one door and the data
+the caller holds the slot grant on, nothing more. A literal path, and
+consent's `callers`, are decided as before.
+
+What a role on a **peer's address** opens: the slot's grant `dyn.{peer}`
+held on `/dyn.peer.shop.*` (or `/dyn.*`, or a session capped there) opens
+the peer's **ordinary methods only — none of its whole-activation
+(`everywhere`) ones**, in process or across the hop. Those — an
+in-process bridge's `add`, `replace` and `remove` among them, held "on `*`
+only, never through a scoped grant" (DYNAUTH-31) — need the method's own
+grant at the peer's address: `admin`, or a role listing the literal method
+(`dyn.peer.shop.restock`), held on `/dyn.peer.shop.*` or a `.*` above it;
+or anything on `*`. So `admin on /dyn.peer.bridge.*` is the bridge's admin;
+`operator on /dyn.*` is not.
+
+**Not closed here** (a follow-up to KEEL-44): a peer's literal path held on
+a *data* scope still reaches its ordinary methods — an admin of `KILN`
+(`admin` lists every grant, literal paths among them), a role listing
+`dyn.peer.shop.stock` on `KILN`, a consented caller wherever its role is
+held.
+
+**Consent of a need into a peer is `*` or an address.** A need narrowed to
+a data scope (`dyn.peer.t.claims@MENGER`) could never be met — a peer is
+reached at its door, which no data scope opens — so `dyn.consent` refuses
+it in band, naming why; narrow it to the peer's address instead
+(`dyn.peer.t.claims@/dyn.peer.t.*`: the call back holds that one call's
+door). A consent kept so before is loaded as kept, and warned of at start.
+
+The smallest grant that escalates: `auth.role_set` held on
+`/auth.role_set` (or `/auth`, `/auth.*`) plus any membership on `*` makes
+its holder `admin@*` (plexus-core's README, "Doors").
 
 ## At the top level (`top_level`)
 

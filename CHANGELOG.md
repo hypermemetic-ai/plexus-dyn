@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+ONE-7: tests, and one row flipped (the change is plexus-core 0.11.4's, on
+plexus-auth-core 0.3.4). **dyn's door, and one peer's**: a role held on an
+address — `operator on /dyn` (dyn's own whole-service methods: `connect`,
+`disconnect`, …), `operator on /dyn.peer.shop.*` (the peer `shop` alone),
+`operator on /dyn.*` (dyn and every peer) — opens that door and holds no
+data. KEEL-44 is closed for the slot grant: a role listing `dyn.{peer}` on a
+data scope reaches no peer; consent's `callers` reach the peer's methods
+and schema as before (literal grants). `tests/one7_door.rs`, over keyed,
+token-verifying WebSocket peers: an operator of `/dyn` connects and an
+admin of `KILN` does not; the shopkeeper reaches `shop` (its far side admits
+it at the door: no data held, the token's scope `shop.stock@/shop.stock`)
+and is refused `till` and `dyn.connect`; the shop's call back to `till`
+runs under no more than the call held (the door of `shop` alone), with
+tokens and without; a session capped to one peer's door stays capped
+through the hop and back, one capped to a data scope opens no peer; a
+consented viewer of a data scope still calls the shop and reads its schema.
+An admin of a data scope still reaches a peer's ordinary methods by their
+literal path (admin lists every grant) — said by a row, not closed here.
+
+ONE-7 review round 1:
+
+- **M1 — a peer's whole-activation methods are its own grant's.** The slot
+  grant `dyn.{peer}` held on a peer's address (`/dyn.peer.vault.*`,
+  `/dyn.*`, a session capped to the peer or to the very method) runs the
+  peer's ordinary methods and **no `everywhere` method** — in process (the
+  bridge's `add`/`replace`/`remove`, DYNAUTH-31) or across the hop. The
+  method's own grant at the peer's address — `admin`, or a role listing
+  the literal method, on `/dyn.peer.<name>.*` or a `.*` above — does run
+  it, the far side told so by `limit.door_own`. Rows: the reviewer's three
+  probes over an in-process `vault` and the remote `shop`; the method's own
+  grant runs `vault.wipe` and `shop.restock`. **Flipped:** the shopkeeper's
+  `shop.restock` (operator on `/dyn.peer.shop.*`) is refused, where it ran.
+- **L1 — `dyn.consent` refuses a need it could never meet**: a need into a
+  peer (`dyn.peer.<name>.<m>`, or `<name>.<m>` at the top level) narrowed
+  to a data scope is refused in band, naming why. Chosen over answering
+  `unmeetable`: refusing at `consent` breaks nothing kept (the store is
+  not re-checked at load), so a consent kept so before loads as it was and
+  is warned of in the log; `ConsentInfo` is unchanged.
+- **Not closed (M2, a follow-up ticket):** a peer's literal path held on a
+  data scope still reaches its ordinary methods — an admin of `KILN`, a
+  role listing `dyn.peer.shop.stock` on `KILN`, a consented caller.
+
+`dyn.rs` (KEEL-19 N2) **flips**: a consent narrowed to a data scope while a
+call is open (`dyn.peer.t.claims@MENGER`) used to be consented and then
+refuse the next call back into `t` (a peer is reached at its door, which no
+data scope opens); it is now refused at `consent` (L1). The row narrows to
+`t`'s address instead (`…@/dyn.peer.t.*`), and the open call's next call
+back holds that one door, `tell.claims@/tell.claims`, not the token's `*`.
+
 KEEL-51: tests only (the fix is plexus-core's, its next release after
 0.11.2). `keel51_a_capped_session_is_refused_through_a_dialed_peers_call_back`
 — an admin capped to `viewer@*`, refused `dyn.peer.v.forecast` itself, is
