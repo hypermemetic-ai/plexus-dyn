@@ -44,6 +44,34 @@ carries that door across the hop for that call alone (plexus-wire spec/12
 the caller holds the slot grant on, nothing more. A literal path, and
 consent's `callers`, are decided as before.
 
+What a role on a **peer's address** opens: the slot's grant `dyn.{peer}`
+held on `/dyn.peer.shop.*` (or `/dyn.*`, or a session capped there) opens
+the peer's **ordinary methods only — none of its whole-activation
+(`everywhere`) ones**, in process or across the hop. Those — an
+in-process bridge's `add`, `replace` and `remove` among them, held "on `*`
+only, never through a scoped grant" (DYNAUTH-31) — need the method's own
+grant at the peer's address: `admin`, or a role listing the literal method
+(`dyn.peer.shop.restock`), held on `/dyn.peer.shop.*` or a `.*` above it;
+or anything on `*`. So `admin on /dyn.peer.bridge.*` is the bridge's admin;
+`operator on /dyn.*` is not.
+
+**Not closed here** (a follow-up to KEEL-44): a peer's literal path held on
+a *data* scope still reaches its ordinary methods — an admin of `KILN`
+(`admin` lists every grant, literal paths among them), a role listing
+`dyn.peer.shop.stock` on `KILN`, a consented caller wherever its role is
+held.
+
+**Consent of a need into a peer is `*` or an address.** A need narrowed to
+a data scope (`dyn.peer.t.claims@MENGER`) could never be met — a peer is
+reached at its door, which no data scope opens — so `dyn.consent` refuses
+it in band, naming why; narrow it to the peer's address instead
+(`dyn.peer.t.claims@/dyn.peer.t.*`: the call back holds that one call's
+door). A consent kept so before is loaded as kept, and warned of at start.
+
+The smallest grant that escalates: `auth.role_set` held on
+`/auth.role_set` (or `/auth`, `/auth.*`) plus any membership on `*` makes
+its holder `admin@*` (plexus-core's README, "Doors").
+
 ## At the top level (`top_level`)
 
 With `DynOptions { top_level: true, .. }` (the example's `--top-level`),
