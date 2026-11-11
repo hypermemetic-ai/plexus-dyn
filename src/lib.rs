@@ -898,7 +898,18 @@ impl DynActivation {
     /// DYNAUTH-5: the consent kept in the data directory, read at start.
     fn loaded(self) -> Self {
         match consent::Store::load(&self.store_path()) {
-            Ok(s) => *self.inner.store.lock().unwrap() = s,
+            Ok(s) => {
+                // ONE-7 (review L1): a consent kept before the door, narrowed
+                // to a data scope on a call into a peer, is loaded as kept —
+                // and said: no call back it covers is admitted.
+                for (peer, c) in &s.consents {
+                    let never = consent::unmeetable(&c.needs, consent::through_the_slot);
+                    if !never.is_empty() {
+                        tracing::warn!(target: "plexus::dyn", peer = %peer, needs = ?never, "consent kept on a data scope for a call into a peer: never met (a peer's door is not a data scope's); consent it again on `*` or the peer's address");
+                    }
+                }
+                *self.inner.store.lock().unwrap() = s;
+            }
             Err(why) => tracing::error!(target: "plexus::dyn", "consent not read, none kept: {why}"),
         }
         self
@@ -1028,6 +1039,15 @@ impl DynActivation {
         };
         let c = Consent { needs, callers, key: child.peer_key().map(str::to_string), holder: consent::remote_holder(&child) };
         consent::check(peer, &c, Self::declared(&child).as_deref())?;
+        // ONE-7 (review L1): refused in band, not kept to fail every call back.
+        let top = self.inner.top.lock().unwrap().clone();
+        let never = consent::unmeetable(&c.needs, |m| consent::through_the_slot(m) || m.split_once('.').is_some_and(|(p, _)| top.contains(p)));
+        if !never.is_empty() {
+            return Err(format!(
+                "{} can never be met: a call into a peer is decided at its door, which a data scope does not open — consent it on `*`, or on the peer's address (`…@/dyn.peer.<name>.*`)",
+                never.join(", ")
+            ));
+        }
         self.inner.store.lock().unwrap().consents.insert(peer.to_string(), c.clone());
         self.save_store()?;
         self.hold(peer, &child);

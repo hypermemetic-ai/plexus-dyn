@@ -12,6 +12,14 @@
 //! - the **viewer** holds `viewer` on `KILN`, and consent names `viewer`
 //!   among the shop's callers.
 //!
+//! - the **vaultkeeper** holds `operator` on `/dyn.peer.vault.*` — the
+//!   in-process peer `vault` (attached as the bridge is);
+//! - the **shop admin** holds `admin` on `/dyn.peer.shop.*` and on
+//!   `/dyn.peer.vault.*`;
+//! - the **restocker** holds `restocker` — a role listing the peers' own
+//!   `dyn.peer.shop.restock` and `dyn.peer.vault.wipe` — on
+//!   `/dyn.peer.shop.*` and `/dyn.peer.vault.*`.
+//!
 //! `operator` lists `dyn.connect`, `dyn.disconnect` and the peer slot's
 //! grant `dyn.{peer}`.
 
@@ -35,6 +43,9 @@ const KILN_OPERATOR: &str = "key:04040404040404040404040404040404040404040404040
 const KILN_ADMIN: &str = "key:0303030303030303030303030303030303030303030303030303030303030303";
 const VIEWER: &str = "key:0707070707070707070707070707070707070707070707070707070707070707";
 const CLERK: &str = "key:0808080808080808080808080808080808080808080808080808080808080808";
+const VAULTKEEPER: &str = "key:0909090909090909090909090909090909090909090909090909090909090909";
+const SHOP_ADMIN: &str = "key:0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+const RESTOCKER: &str = "key:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
 
 // ------------------------------------------------------------------ the peers
 
@@ -77,6 +88,25 @@ impl TillActivation {
 }
 
 #[derive(Clone)]
+pub struct VaultActivation;
+
+/// A vault served in process, as the bridge is (`dyn.attach`).
+#[plexus_macros::activation(namespace = "vault", version = "1.0.0")]
+impl VaultActivation {
+    /// An ordinary method.
+    #[plexus_macros::method]
+    pub async fn look(&self) -> Value {
+        json!("looked")
+    }
+
+    /// Acts on the whole vault — as the bridge's `add` does on the bridge.
+    #[plexus_macros::method(everywhere)]
+    pub async fn wipe(&self) -> Value {
+        json!("wiped")
+    }
+}
+
+#[derive(Clone)]
 pub struct ClerkActivation {
     dyn_: DynActivation,
 }
@@ -110,6 +140,10 @@ fn reached() -> Value {
         .unwrap_or(Value::Null);
     json!({
         "caller": caller.auth().and_then(|a| a.principal()).map(|p| p.to_string()),
+        // Review M1: whether this call's door would run the shop's own
+        // whole-activation method here — the hop said the door is the
+        // method's own (`limit.door_own`), or it holds `*`.
+        "whole": plexus_core::call::admits_everywhere("shop.stock").is_ok(),
         "activation": reach.holds_activation(),
         "everywhere": reach.is_everywhere(),
         "held_on": held,
@@ -176,6 +210,7 @@ async fn world_minting(tokens: bool) -> World {
     let dyn_ = DynActivation::new(opts);
     let mut lists: Vec<(String, Vec<String>)> = DynamicHub::new("host").register(dyn_.clone()).declared_roles().into_iter().collect();
     lists.push(("operator".into(), vec!["dyn.connect".into(), "dyn.disconnect".into(), "dyn.{peer}".into(), "clerk.peek".into()]));
+    lists.push(("restocker".into(), vec!["dyn.peer.shop.restock".into(), "dyn.peer.vault.wipe".into()]));
     let roles = RoleTable::from_lists(lists.iter().map(|(r, g)| (r.as_str(), g.iter().map(String::as_str))));
     let members = Arc::new(Members::default());
     for (who, role, scope) in [
@@ -187,6 +222,11 @@ async fn world_minting(tokens: bool) -> World {
         (KILN_ADMIN, "admin", "KILN"),
         (VIEWER, "viewer", "KILN"),
         (CLERK, "operator", "/clerk"),
+        (VAULTKEEPER, "operator", "/dyn.peer.vault.*"),
+        (SHOP_ADMIN, "admin", "/dyn.peer.shop.*"),
+        (SHOP_ADMIN, "admin", "/dyn.peer.vault.*"),
+        (RESTOCKER, "restocker", "/dyn.peer.shop.*"),
+        (RESTOCKER, "restocker", "/dyn.peer.vault.*"),
     ] {
         members.0.lock().unwrap().push(Membership { principal: who.parse().unwrap(), role: plexus_auth_core::RoleName::new(role), scope: ScopeRef::parse(scope) });
     }
@@ -194,6 +234,7 @@ async fn world_minting(tokens: bool) -> World {
     let clerk = ClerkActivation { dyn_: dyn_.clone() };
     let host = Arc::new(DynamicHub::new("host").register(dyn_.clone()).register(clerk).with_gate(gate));
     dyn_.start(&host).await.unwrap();
+    dyn_.attach("vault", "test", "b1", Arc::new(VaultActivation), false);
     let jwks = dyn_.jwk_set();
     let trusted = vec![dyn_.dial_principal().expect("dyn dials with a key")];
     let jwks = tokens.then_some(jwks);
@@ -293,11 +334,57 @@ async fn an_operator_of_one_peer_reaches_it_and_is_admitted_at_its_far_side() {
     let got = w.call(SHOPKEEPER, "dyn.peer.shop.stock", json!({})).await;
     assert_eq!(
         got[0],
-        json!({ "caller": SHOPKEEPER, "activation": true, "everywhere": false, "held_on": [], "token_scope": "shop.stock@/shop.stock" }),
-        "the far side holds the door of this call alone, and no data: {got:?}"
+        json!({ "caller": SHOPKEEPER, "whole": false, "activation": true, "everywhere": false, "held_on": [], "token_scope": "shop.stock@/shop.stock" }),
+        "the far side holds the door of this call alone, and no data — a slot's door, not the method's own: {got:?}"
     );
-    // The shop's own whole-activation method: the far side admits it at the door too.
-    assert_eq!(w.call(SHOPKEEPER, "dyn.peer.shop.restock", json!({})).await, [json!("restocked")]);
+    // Review M1 (flipped: until this round the shopkeeper restocked): the
+    // shop's whole-activation method is not the slot grant's.
+    assert!(refused(&w.call(SHOPKEEPER, "dyn.peer.shop.restock", json!({})).await, "shop.restock"));
+}
+
+/// Review M1, the reviewer's three probes: the slot's grant `dyn.{peer}` at
+/// a peer's address — on the peer, on everything of dyn, a session capped
+/// to the peer or to the very method — runs no whole-activation method of
+/// the peer: not the in-process vault's `wipe` (the bridge's shape), not
+/// the remote shop's `restock`. Their ordinary methods it does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_slot_grant_at_a_peers_address_runs_no_whole_activation_method() {
+    let w = world().await;
+    for who in [VAULTKEEPER, GARDENER] {
+        let got = w.call(who, "dyn.peer.vault.wipe", json!({})).await;
+        assert!(refused(&got, "vault.wipe"), "{who}: {got:?}");
+        assert_eq!(w.call(who, "dyn.peer.vault.look", json!({})).await, [json!("looked")], "{who}");
+    }
+    for cap in ["operator@/dyn.peer.vault.*", "operator@/dyn.peer.vault.wipe"] {
+        let got = w.owner_capped(&[cap], "dyn.peer.vault.wipe").await;
+        assert!(refused(&got, "vault.wipe"), "{cap}: {got:?}");
+    }
+    assert_eq!(w.owner_capped(&["operator@/dyn.peer.vault.*"], "dyn.peer.vault.look").await, [json!("looked")]);
+    for who in [SHOPKEEPER, GARDENER] {
+        assert!(refused(&w.call(who, "dyn.peer.shop.restock", json!({})).await, "shop.restock"), "{who}");
+    }
+    assert!(refused(&w.owner_capped(&["operator@/dyn.peer.shop.*"], "dyn.peer.shop.restock").await, "shop.restock"));
+}
+
+/// Review M1: the method's own grant at the peer's address runs it — admin
+/// there, or a role listing the peer's method; in process, and across the
+/// hop, where the far side is told the door is the method's own
+/// (`limit.door_own`) and its own backstop runs it. Not at another peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_methods_own_grant_at_a_peers_address_runs_it() {
+    let w = world().await;
+    for who in [SHOP_ADMIN, RESTOCKER] {
+        assert_eq!(w.call(who, "dyn.peer.vault.wipe", json!({})).await, [json!("wiped")], "{who}");
+        assert_eq!(w.call(who, "dyn.peer.shop.restock", json!({})).await, [json!("restocked")], "{who}");
+        assert!(refused(&w.call(who, "dyn.peer.till.count", json!({})).await, "dyn.{peer}"), "{who}");
+    }
+    assert_eq!(w.owner_capped(&["admin@/dyn.peer.vault.*"], "dyn.peer.vault.wipe").await, [json!("wiped")]);
+    assert_eq!(w.owner_capped(&["admin@/dyn.*"], "dyn.peer.shop.restock").await, [json!("restocked")]);
+    // The far side is told: the shop admin's door is the method's own; the shopkeeper's, the slot's.
+    let got = w.call(SHOP_ADMIN, "dyn.peer.shop.stock", json!({})).await;
+    assert_eq!((got[0]["whole"].clone(), got[0]["activation"].clone(), got[0]["held_on"].clone()), (json!(true), json!(true), json!([])), "{got:?}");
+    // The restocker's role lists `restock` alone: the shop's other methods are not its.
+    assert!(refused(&w.call(RESTOCKER, "dyn.peer.shop.stock", json!({})).await, "dyn.{peer}"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
