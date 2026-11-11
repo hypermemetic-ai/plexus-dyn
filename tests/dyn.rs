@@ -2277,6 +2277,136 @@ async fn dynauth31_holds_says_whether_a_peer_may_act() {
     assert!(r.dyn_.holds("p", &q).is_err());
 }
 
+// ------------------------------------------------------------------ KEEL-59
+
+/// Work that marks the time (unix ms) in `path` every 2 ms, saying only
+/// that it started: a URL peer's.
+#[derive(Clone)]
+pub struct TickActivation;
+
+#[plexus_macros::activation]
+impl TickActivation {
+    /// Work, marking `path`.
+    #[plexus_macros::method]
+    pub async fn work(&self, path: String) -> impl Stream<Item = Value> + Send + 'static {
+        async_stream::stream! {
+            yield json!("started");
+            loop {
+                let _ = std::fs::write(&path, unix_ms().to_string());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+/// The same work in a dendrite: a generator marking `path` every 5 ms.
+const TICKING: &str = r#"// A dendrite whose work marks the time in `path`.
+import { writeFileSync } from "node:fs";
+
+/** Work, marking `path` every 5 ms. */
+export async function* work({ path }: { path: string }) {
+  yield "started";
+  for (;;) {
+    writeFileSync(path, String(Date.now()));
+    await new Promise((r) => setTimeout(r, 5));
+    yield "working";
+  }
+}
+"#;
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+}
+
+/// A far service serving `TickActivation` on `port`.
+async fn far_ticking(port: u16) -> jsonrpsee::server::ServerHandle {
+    let module = DynamicHub::arc_into_rpc_module(Arc::new(DynamicHub::new("far").register(TickActivation))).unwrap();
+    jsonrpsee::server::Server::builder().build(format!("127.0.0.1:{port}")).await.unwrap().start(module)
+}
+
+/// Open `dyn.peer.<method>` as USER, read until its work is under way,
+/// `cut` the peer (as an admin), then: the call's one last item, its
+/// `child_unavailable` naming `why`, and the work stopped within 100 ms
+/// of the cut.
+async fn cut_off(r: &Rig, method: &str, mark: &std::path::Path, cut: Value, why: &str) {
+    let peer = method.split('.').next().unwrap();
+    let _ = std::fs::remove_file(mark);
+    let path = mark.display().to_string();
+    let (first, mut open) = {
+        let mut s = r.host.route(&format!("dyn.peer.{method}"), json!({ "path": path }), Some(&who(USER))).await.unwrap();
+        let first = match tokio::time::timeout(Duration::from_secs(10), s.next()).await.expect("an item") {
+            Some(PlexusStreamItem::Data { content, .. }) => content.into_value(),
+            other => panic!("{peer}: {other:?}"),
+        };
+        (first, s)
+    };
+    assert_eq!(first, json!("started"), "{peer}");
+    // Read on (the rest of the stream) in the background, as a client does.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(i) = open.next().await {
+            let _ = tx.send(serde_json::to_value(&i).unwrap());
+        }
+    });
+    let started = Instant::now();
+    while !mark.exists() {
+        assert!(started.elapsed() < Duration::from_secs(10), "{peer}: no work began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let how = if cut.get("peer").is_some() { "dyn.revoke" } else { "dyn.disconnect" };
+    let cause = unix_ms();
+    let done = call(r, ADMIN, how, cut).await;
+    assert!(done[0]["type"] == "revoked" || done[0]["type"] == "disconnected", "{done:?}");
+    // One item saying why, then the end; data the peer sent before is all
+    // that may come ahead of it.
+    let end = loop {
+        let v = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("told within 5 s").expect("an end, not silence");
+        if v["type"] != "data" {
+            break v;
+        }
+    };
+    assert_eq!(end["type"], "error", "{peer}: {end}");
+    assert_eq!(end["error_kind"], "child_unavailable", "{peer}: {end}");
+    assert!(end["message"].as_str().is_some_and(|m| m.contains(why)), "{peer}: {end}");
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.expect("ended"), None, "{peer}: one item, then the end");
+    // The work, where it runs: stopped within 100 ms of the cut.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let last: u128 = std::fs::read_to_string(mark).unwrap().trim().parse().unwrap();
+    assert!(last <= cause + 100, "{peer}: its work ran {} ms past the cut", last as i128 - cause as i128);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(std::fs::read_to_string(mark).unwrap().trim().parse::<u128>().unwrap(), last, "{peer}: its work went on");
+    println!("    {peer} ({how}): last unit of work {:+} ms from the cut", last as i128 - cause as i128);
+    // Nothing more is forwarded to it.
+    let next = call(r, USER, &format!("dyn.peer.{method}"), json!({ "path": path })).await;
+    assert!(next.first().is_some_and(|v| v["type"] == "error" || v.get("route_error").is_some()), "{peer}: forwarded after the cut: {next:?}");
+}
+
+/// KEEL-59: `dyn.revoke` and `dyn.disconnect` end every call open into a
+/// URL peer and a dendrite, as they do an in-process peer's: one item
+/// saying why, the peer told to stop, its work stopped.
+async fn keel59_a_peer_cut_off_ends_the_calls_into_it() {
+    let port = free_port();
+    let far = far_ticking(port).await;
+    let r = rig().await;
+    let marks = tempfile::tempdir().unwrap();
+    let url = format!("ws://127.0.0.1:{port}");
+    for name in ["u1", "u2"] {
+        let got = call(&r, ADMIN, "dyn.connect", json!({ "name": name, "url": url })).await;
+        assert_eq!(got[0]["type"], "connected", "{got:?}");
+    }
+    cut_off(&r, "u1.tick.work", &marks.path().join("u1"), json!({ "peer": "u1", "why": "its key leaked" }), "revoked: its key leaked").await;
+    cut_off(&r, "u2.tick.work", &marks.path().join("u2"), json!({ "name": "u2" }), "disconnected").await;
+    // Dendrites: each marks a file in its own directory.
+    let data = r.dyn_.options().data_dir.clone();
+    for name in ["d1", "d2"] {
+        let grown = call(&r, ADMIN, "dyn.grow", json!({ "name": name, "source": TICKING, "targets": [] })).await;
+        assert_eq!(grown[0]["type"], "connected", "{grown:?}");
+    }
+    cut_off(&r, "d1.work", &data.join("d1/mark"), json!({ "peer": "d1", "why": "it misbehaved" }), "revoked: it misbehaved").await;
+    cut_off(&r, "d2.work", &data.join("d2/mark"), json!({ "name": "d2" }), "disconnected").await;
+    stop(far).await;
+}
+
 fn main() {
     // DYNAUTH-7: every `plexus::audit` line, kept for a test to read.
     tracing_subscriber::fmt().with_env_filter("plexus::audit=info").with_writer(|| AuditWriter).with_ansi(false).init();
@@ -2339,7 +2469,8 @@ fn main() {
             dynauth31_consent_gives_an_in_process_peer_callers_only,
             dynauth31_revoke_and_disconnect_stop_an_in_process_peer,
             dynauth31_a_consent_is_its_holders_not_its_names,
-            dynauth31_holds_says_whether_a_peer_may_act
+            dynauth31_holds_says_whether_a_peer_may_act,
+            keel59_a_peer_cut_off_ends_the_calls_into_it
         );
         println!("\ntest result: ok. {n} passed; 0 failed");
     });
